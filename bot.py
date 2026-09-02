@@ -1,46 +1,88 @@
 import os
 import time
+import math
 import threading
 from datetime import datetime
 
 import requests
-from flask import Flask
+
+import matplotlib
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+
+from flask import Flask, jsonify
 
 
 # =========================================================
 # CONFIG
 # =========================================================
 
-BOT_NAME = "KAIF X PRO"
+BOT_NAME = "KAIF X PRO BOT"
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 
-PAIRS = {
+TIMEFRAME = "1 MINUTE"
+EXPIRY = "1 MINUTE"
+
+ANALYSIS_INTERVAL = 60
+MIN_SCORE = 4
+
+CHART_DIR = "generated_charts"
+os.makedirs(CHART_DIR, exist_ok=True)
+
+
+# =========================================================
+# LIVE MARKET PAIRS
+# =========================================================
+
+LIVE_PAIRS = {
     "EUR/USD": "EURUSD=X",
     "GBP/USD": "GBPUSD=X",
-    "USD/JPY": "USDJPY=X",
+    "USD/JPY": "JPY=X",
     "AUD/USD": "AUDUSD=X",
-    "USD/CAD": "USDCAD=X",
-    "USD/CHF": "USDCHF=X",
+    "USD/CAD": "CAD=X",
+    "USD/CHF": "CHF=X",
     "NZD/USD": "NZDUSD=X",
     "EUR/JPY": "EURJPY=X",
     "GBP/JPY": "GBPJPY=X",
     "EUR/GBP": "EURGBP=X",
 }
 
-TIMEFRAME = "1 Minute"
-EXPIRY = "1 Minute"
-MIN_SCORE = 4
+
+# =========================================================
+# OTC PAIRS
+#
+# IMPORTANT:
+# These are only pair names for the OTC module.
+# Real candles must come from an authorized/valid data source.
+# =========================================================
+
+OTC_PAIRS = [
+    "EUR/USD OTC",
+    "GBP/USD OTC",
+    "USD/JPY OTC",
+    "AUD/USD OTC",
+    "USD/CAD OTC",
+    "USD/CHF OTC",
+    "EUR/JPY OTC",
+    "GBP/JPY OTC",
+]
+
 
 subscribers = set()
-last_signal = {}
 
-# Prevent multiple listener threads
-telegram_started = False
+state_lock = threading.Lock()
+
+services_started = False
+
+last_sent_key = None
+last_sent_time = 0
 
 
 # =========================================================
-# FLASK SERVER
+# FLASK
 # =========================================================
 
 app = Flask(__name__)
@@ -48,10 +90,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return f"""
-    <h2>👑 {BOT_NAME}</h2>
-    <p>Telegram Signal Bot is running.</p>
-    """
+    return f"{BOT_NAME} is running"
 
 
 @app.route("/health")
@@ -59,129 +98,130 @@ def health():
     return "OK", 200
 
 
+@app.route("/status")
+def status():
+    return jsonify({
+        "bot": BOT_NAME,
+        "telegram": bool(TELEGRAM_TOKEN),
+        "subscribers": len(subscribers),
+        "live_pairs": len(LIVE_PAIRS),
+        "otc_pairs": len(OTC_PAIRS),
+        "mode": "BEST SINGLE SIGNAL"
+    })
+
+
 # =========================================================
-# TELEGRAM API
+# TELEGRAM
 # =========================================================
 
-def telegram_request(method, data=None, request_type="post"):
+TELEGRAM_BASE = "https://api.telegram.org"
+
+
+def telegram_url(method):
+    return f"{TELEGRAM_BASE}/bot{TELEGRAM_TOKEN}/{method}"
+
+
+def telegram_request(method, data=None):
 
     if not TELEGRAM_TOKEN:
-        print("ERROR: TELEGRAM_TOKEN is missing.")
         return {}
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
 
     try:
 
-        if request_type == "get":
-            response = requests.get(
-                url,
-                params=data or {},
-                timeout=35
-            )
-        else:
-            response = requests.post(
-                url,
-                json=data or {},
-                timeout=30
-            )
+        response = requests.post(
+            telegram_url(method),
+            data=data or {},
+            timeout=30
+        )
 
-        response.raise_for_status()
+        return response.json()
 
-        result = response.json()
+    except Exception as e:
 
-        if not result.get("ok"):
-            print(f"Telegram API error [{method}]:", result)
+        print("Telegram error:", e)
 
-        return result
-
-    except requests.exceptions.RequestException as e:
-        print(f"Telegram request error [{method}]:", e)
-        return {}
-
-    except ValueError:
-        print(f"Invalid Telegram response [{method}]")
         return {}
 
 
-# =========================================================
-# SEND MESSAGE
-# =========================================================
+def telegram_get_updates(params):
+
+    if not TELEGRAM_TOKEN:
+        return {}
+
+    try:
+
+        response = requests.get(
+            telegram_url("getUpdates"),
+            params=params,
+            timeout=40
+        )
+
+        return response.json()
+
+    except Exception as e:
+
+        print("Telegram updates error:", e)
+
+        return {}
+
 
 def send_message(chat_id, text):
 
     return telegram_request(
         "sendMessage",
         {
-            "chat_id": chat_id,
+            "chat_id": str(chat_id),
             "text": text,
-            "parse_mode": "HTML",
+            "parse_mode": "HTML"
         }
     )
 
 
+def send_photo(chat_id, path, caption):
+
+    if not TELEGRAM_TOKEN:
+        return {}
+
+    try:
+
+        with open(path, "rb") as photo:
+
+            response = requests.post(
+                telegram_url("sendPhoto"),
+                data={
+                    "chat_id": str(chat_id),
+                    "caption": caption,
+                    "parse_mode": "HTML"
+                },
+                files={
+                    "photo": photo
+                },
+                timeout=60
+            )
+
+        return response.json()
+
+    except Exception as e:
+
+        print("Photo error:", e)
+
+        return {}
+
+
 # =========================================================
-# TEST TELEGRAM
+# LIVE MARKET DATA
 # =========================================================
 
-def test_telegram():
+def get_live_candles(symbol):
 
-    print("=" * 45)
-    print("Testing Telegram connection...")
-    print("=" * 45)
-
-    result = telegram_request("getMe")
-
-    if result.get("ok"):
-
-        bot = result.get("result", {})
-
-        print("Telegram connected successfully!")
-        print("Bot username:", bot.get("username"))
-        print("Bot name:", bot.get("first_name"))
-
-        return True
-
-    print("Telegram connection FAILED.")
-    return False
-
-
-# =========================================================
-# REMOVE WEBHOOK
-# =========================================================
-
-def remove_webhook():
-
-    print("Removing Telegram webhook...")
-
-    result = telegram_request(
-        "deleteWebhook",
-        {
-            "drop_pending_updates": True
-        }
+    url = (
+        "https://query1.finance.yahoo.com/"
+        f"v8/finance/chart/{symbol}"
     )
-
-    if result.get("ok"):
-        print("Webhook removed successfully.")
-    else:
-        print("Webhook removal failed.")
-
-
-# =========================================================
-# GET MARKET DATA
-# =========================================================
-
-def get_candles(symbol):
-
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 
     params = {
         "interval": "1m",
-        "range": "1d",
-    }
-
-    headers = {
-        "User-Agent": "Mozilla/5.0"
+        "range": "1d"
     }
 
     try:
@@ -189,27 +229,36 @@ def get_candles(symbol):
         response = requests.get(
             url,
             params=params,
-            headers=headers,
+            headers={
+                "User-Agent": "Mozilla/5.0"
+            },
             timeout=20
         )
 
         if response.status_code != 200:
-            print(
-                f"Yahoo error for {symbol}: "
-                f"{response.status_code}"
-            )
             return []
 
         data = response.json()
 
-        chart = data.get("chart", {})
-        result = chart.get("result")
+        result = (
+            data.get("chart", {})
+            .get("result", [])
+        )
 
         if not result:
-            print(f"No market data for {symbol}")
             return []
 
-        quote = result[0]["indicators"]["quote"][0]
+        result = result[0]
+
+        timestamps = result.get(
+            "timestamp",
+            []
+        )
+
+        quote = (
+            result.get("indicators", {})
+            .get("quote", [{}])[0]
+        )
 
         opens = quote.get("open", [])
         highs = quote.get("high", [])
@@ -218,39 +267,77 @@ def get_candles(symbol):
 
         candles = []
 
-        length = min(
-            len(opens),
-            len(highs),
-            len(lows),
-            len(closes)
-        )
+        for i in range(
+            min(
+                len(timestamps),
+                len(opens),
+                len(highs),
+                len(lows),
+                len(closes)
+            )
+        ):
 
-        for i in range(length):
+            values = [
+                opens[i],
+                highs[i],
+                lows[i],
+                closes[i]
+            ]
 
-            if (
-                opens[i] is None
-                or highs[i] is None
-                or lows[i] is None
-                or closes[i] is None
-            ):
+            if any(v is None for v in values):
                 continue
 
             candles.append({
+                "timestamp": timestamps[i],
                 "open": float(opens[i]),
                 "high": float(highs[i]),
                 "low": float(lows[i]),
-                "close": float(closes[i]),
+                "close": float(closes[i])
             })
 
         return candles
 
     except Exception as e:
-        print(f"Market data error for {symbol}: {e}")
+
+        print(
+            "Live market error:",
+            symbol,
+            e
+        )
+
         return []
 
 
 # =========================================================
-# EMA
+# OTC MARKET DATA
+#
+# CONNECT YOUR AUTHORIZED DATA SOURCE HERE
+# =========================================================
+
+def get_otc_candles(pair):
+
+    """
+    This function intentionally returns an empty list
+    until a valid authorized OTC candle feed is connected.
+
+    Expected output format:
+
+    [
+        {
+            "timestamp": 1234567890,
+            "open": 1.10000,
+            "high": 1.10100,
+            "low": 1.09900,
+            "close": 1.10050
+        }
+    ]
+    """
+
+    return []
+
+
+# =========================================================
+# INDICATORS
 # =========================================================
 
 def calculate_ema(values, period):
@@ -262,15 +349,16 @@ def calculate_ema(values, period):
 
     ema = sum(values[:period]) / period
 
-    for price in values[period:]:
-        ema = ((price - ema) * multiplier) + ema
+    for value in values[period:]:
+
+        ema = (
+            (value - ema)
+            * multiplier
+            + ema
+        )
 
     return ema
 
-
-# =========================================================
-# RSI
-# =========================================================
 
 def calculate_rsi(values, period=14):
 
@@ -280,32 +368,25 @@ def calculate_rsi(values, period=14):
     gains = []
     losses = []
 
-    for i in range(1, period + 1):
+    for i in range(1, len(values)):
 
         change = values[i] - values[i - 1]
 
         gains.append(max(change, 0))
         losses.append(max(-change, 0))
 
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
+    recent_gains = gains[-period:]
+    recent_losses = losses[-period:]
 
-    for i in range(period + 1, len(values)):
+    avg_gain = (
+        sum(recent_gains)
+        / period
+    )
 
-        change = values[i] - values[i - 1]
-
-        gain = max(change, 0)
-        loss = max(-change, 0)
-
-        avg_gain = (
-            (avg_gain * (period - 1) + gain)
-            / period
-        )
-
-        avg_loss = (
-            (avg_loss * (period - 1) + loss)
-            / period
-        )
+    avg_loss = (
+        sum(recent_losses)
+        / period
+    )
 
     if avg_loss == 0:
         return 100
@@ -314,10 +395,6 @@ def calculate_rsi(values, period=14):
 
     return 100 - (100 / (1 + rs))
 
-
-# =========================================================
-# BOLLINGER BANDS
-# =========================================================
 
 def calculate_bollinger(values, period=20):
 
@@ -329,260 +406,625 @@ def calculate_bollinger(values, period=20):
     middle = sum(recent) / period
 
     variance = sum(
-        (price - middle) ** 2
-        for price in recent
+        (x - middle) ** 2
+        for x in recent
     ) / period
 
-    std = variance ** 0.5
+    std = math.sqrt(variance)
 
-    upper = middle + (2 * std)
-    lower = middle - (2 * std)
+    upper = middle + 2 * std
+    lower = middle - 2 * std
 
     return upper, middle, lower
 
 
-# =========================================================
-# MACD
-# =========================================================
+def calculate_atr(candles, period=14):
 
-def calculate_macd(values):
+    if len(candles) < period + 1:
+        return None
 
-    if len(values) < 35:
-        return None, None
+    ranges = []
 
-    macd_values = []
+    for i in range(
+        len(candles) - period,
+        len(candles)
+    ):
 
-    for i in range(26, len(values) + 1):
+        current = candles[i]
+        previous = candles[i - 1]
 
-        section = values[:i]
+        tr = max(
+            current["high"] - current["low"],
+            abs(
+                current["high"]
+                - previous["close"]
+            ),
+            abs(
+                current["low"]
+                - previous["close"]
+            )
+        )
 
-        ema12 = calculate_ema(section, 12)
-        ema26 = calculate_ema(section, 26)
+        ranges.append(tr)
 
-        if ema12 is not None and ema26 is not None:
-            macd_values.append(ema12 - ema26)
-
-    if len(macd_values) < 9:
-        return None, None
-
-    macd_line = macd_values[-1]
-    signal_line = calculate_ema(macd_values, 9)
-
-    return macd_line, signal_line
-
-
-# =========================================================
-# CANDLE DIRECTION
-# =========================================================
-
-def candle_direction(candle):
-
-    if candle["close"] > candle["open"]:
-        return "bullish"
-
-    if candle["close"] < candle["open"]:
-        return "bearish"
-
-    return "neutral"
+    return sum(ranges) / len(ranges)
 
 
 # =========================================================
-# ANALYZE PAIR
+# ANALYZE CANDLES
 # =========================================================
 
-def analyze_pair(pair_name, yahoo_symbol):
+def analyze_candles(
+    pair,
+    market_type,
+    candles
+):
 
-    candles = get_candles(yahoo_symbol)
-
-    if len(candles) < 40:
-        print(f"{pair_name}: Not enough candles")
+    if len(candles) < 50:
         return None
 
     closes = [
-        candle["close"]
-        for candle in candles
+        c["close"]
+        for c in candles
     ]
 
-    current_price = closes[-1]
+    price = closes[-1]
 
     ema9 = calculate_ema(closes, 9)
     ema21 = calculate_ema(closes, 21)
 
     rsi = calculate_rsi(closes, 14)
 
-    upper, middle, lower = calculate_bollinger(
-        closes,
-        20
+    upper, middle, lower = (
+        calculate_bollinger(
+            closes,
+            20
+        )
     )
 
-    macd_line, macd_signal = calculate_macd(
-        closes
+    atr = calculate_atr(
+        candles,
+        14
     )
 
-    indicators = [
-        ema9,
-        ema21,
-        rsi,
-        upper,
-        middle,
-        lower,
-        macd_line,
-        macd_signal,
-    ]
-
-    if any(value is None for value in indicators):
+    if any(
+        x is None
+        for x in [
+            ema9,
+            ema21,
+            rsi,
+            middle,
+            atr
+        ]
+    ):
         return None
 
     call_score = 0
     put_score = 0
 
-    call_reasons = []
-    put_reasons = []
+    reasons_call = []
+    reasons_put = []
 
     # EMA
-    if ema9 > ema21:
-        call_score += 1
-        call_reasons.append("EMA 9 above EMA 21")
 
-    elif ema9 < ema21:
+    if ema9 > ema21:
+
+        call_score += 1
+        reasons_call.append(
+            "EMA trend bullish"
+        )
+
+    else:
+
         put_score += 1
-        put_reasons.append("EMA 9 below EMA 21")
+        reasons_put.append(
+            "EMA trend bearish"
+        )
 
     # RSI
+
     if 50 < rsi < 70:
+
         call_score += 1
-        call_reasons.append("RSI bullish zone")
+        reasons_call.append(
+            "RSI bullish zone"
+        )
 
     elif 30 < rsi < 50:
-        put_score += 1
-        put_reasons.append("RSI bearish zone")
 
-    # MACD
-    if macd_line > macd_signal:
-        call_score += 1
-        call_reasons.append("MACD bullish")
-
-    elif macd_line < macd_signal:
         put_score += 1
-        put_reasons.append("MACD bearish")
+        reasons_put.append(
+            "RSI bearish zone"
+        )
 
     # Bollinger
-    if current_price > middle:
-        call_score += 1
-        call_reasons.append("Price above Bollinger middle")
 
-    elif current_price < middle:
+    if price > middle:
+
+        call_score += 1
+        reasons_call.append(
+            "Price above middle trend"
+        )
+
+    else:
+
         put_score += 1
-        put_reasons.append("Price below Bollinger middle")
+        reasons_put.append(
+            "Price below middle trend"
+        )
 
     # Last candle
-    direction = candle_direction(candles[-1])
 
-    if direction == "bullish":
+    last = candles[-1]
+
+    if last["close"] > last["open"]:
+
         call_score += 1
-        call_reasons.append("Last candle bullish")
+        reasons_call.append(
+            "Last candle bullish"
+        )
 
-    elif direction == "bearish":
+    elif last["close"] < last["open"]:
+
         put_score += 1
-        put_reasons.append("Last candle bearish")
+        reasons_put.append(
+            "Last candle bearish"
+        )
 
-    # Signal decision
+    # Previous candle
+
+    previous = candles[-2]
+
+    if (
+        previous["close"]
+        > previous["open"]
+        and last["close"]
+        > last["open"]
+    ):
+
+        call_score += 1
+        reasons_call.append(
+            "Two candles bullish"
+        )
+
+    elif (
+        previous["close"]
+        < previous["open"]
+        and last["close"]
+        < last["open"]
+    ):
+
+        put_score += 1
+        reasons_put.append(
+            "Two candles bearish"
+        )
+
+    # Final
+
     if (
         call_score >= MIN_SCORE
         and call_score > put_score
     ):
-        signal = "CALL"
+
+        direction = "CALL"
         score = call_score
-        reasons = call_reasons
+        reasons = reasons_call
 
     elif (
         put_score >= MIN_SCORE
         and put_score > call_score
     ):
-        signal = "PUT"
+
+        direction = "PUT"
         score = put_score
-        reasons = put_reasons
+        reasons = reasons_put
 
     else:
+
         return None
 
-    agreement = int((score / 5) * 100)
+    confidence = int(
+        (score / 5) * 100
+    )
+
+    strength = (
+        score * 100
+        + confidence
+    )
 
     return {
-        "pair": pair_name,
-        "signal": signal,
+        "pair": pair,
+        "market": market_type,
+        "signal": direction,
         "score": score,
-        "agreement": agreement,
-        "price": current_price,
+        "confidence": confidence,
+        "strength": strength,
+        "price": price,
         "rsi": rsi,
-        "ema9": ema9,
-        "ema21": ema21,
-        "macd": macd_line,
-        "macd_signal": macd_signal,
+        "atr": atr,
         "reasons": reasons,
+        "candles": candles
     }
 
 
 # =========================================================
-# SIGNAL MESSAGE
+# SCAN LIVE MARKET
 # =========================================================
 
-def make_signal_message(signal):
+def scan_live_market():
 
-    if signal["signal"] == "CALL":
-        direction = "🟢 CALL / UP"
-    else:
-        direction = "🔴 PUT / DOWN"
+    results = []
 
-    reasons = "\n".join(
-        f"• {reason}"
-        for reason in signal["reasons"]
+    for pair, symbol in LIVE_PAIRS.items():
+
+        try:
+
+            candles = get_live_candles(symbol)
+
+            result = analyze_candles(
+                pair,
+                "LIVE MARKET",
+                candles
+            )
+
+            if result:
+                results.append(result)
+
+        except Exception as e:
+
+            print(
+                "Live scan error:",
+                pair,
+                e
+            )
+
+        time.sleep(0.3)
+
+    return results
+
+
+# =========================================================
+# SCAN OTC MARKET
+# =========================================================
+
+def scan_otc_market():
+
+    results = []
+
+    for pair in OTC_PAIRS:
+
+        try:
+
+            candles = get_otc_candles(pair)
+
+            if not candles:
+                continue
+
+            result = analyze_candles(
+                pair,
+                "OTC MARKET",
+                candles
+            )
+
+            if result:
+                results.append(result)
+
+        except Exception as e:
+
+            print(
+                "OTC scan error:",
+                pair,
+                e
+            )
+
+    return results
+
+
+# =========================================================
+# GET BEST SIGNAL FROM BOTH MARKETS
+# =========================================================
+
+def get_best_signal():
+
+    print("\nScanning LIVE MARKET...")
+
+    live_results = scan_live_market()
+
+    print("Scanning OTC MARKET...")
+
+    otc_results = scan_otc_market()
+
+    all_results = (
+        live_results
+        + otc_results
     )
 
-    now = datetime.now().strftime(
-        "%Y-%m-%d %H:%M:%S"
+    if not all_results:
+
+        return None
+
+    all_results.sort(
+        key=lambda x: (
+            x["strength"],
+            x["score"],
+            x["confidence"]
+        ),
+        reverse=True
+    )
+
+    return all_results[0]
+
+
+# =========================================================
+# PROJECT NEXT CANDLE
+# =========================================================
+
+def build_projected_candle(signal):
+
+    price = signal["price"]
+    atr = signal["atr"]
+
+    body = max(
+        atr * 0.55,
+        price * 0.00003
+    )
+
+    wick = max(
+        atr * 0.25,
+        price * 0.00001
+    )
+
+    if signal["signal"] == "CALL":
+
+        opening = price
+        closing = price + body
+
+        low = opening - wick
+        high = closing + wick
+
+    else:
+
+        opening = price
+        closing = price - body
+
+        high = opening + wick
+        low = closing - wick
+
+    return {
+        "open": opening,
+        "close": closing,
+        "high": high,
+        "low": low
+    }
+
+
+# =========================================================
+# DRAW CANDLE
+# =========================================================
+
+def draw_candle(
+    ax,
+    x,
+    candle,
+    alpha=1.0,
+    linestyle="-"
+):
+
+    bullish = (
+        candle["close"]
+        >= candle["open"]
+    )
+
+    color = (
+        "#00c853"
+        if bullish
+        else "#ff1744"
+    )
+
+    ax.vlines(
+        x,
+        candle["low"],
+        candle["high"],
+        color=color,
+        linewidth=2,
+        alpha=alpha,
+        linestyles=linestyle
+    )
+
+    low_body = min(
+        candle["open"],
+        candle["close"]
+    )
+
+    height = abs(
+        candle["close"]
+        - candle["open"]
+    )
+
+    minimum = (
+        candle["high"]
+        - candle["low"]
+    ) * 0.04
+
+    if height < minimum:
+        height = minimum
+
+    rectangle = Rectangle(
+        (
+            x - 0.3,
+            low_body
+        ),
+        0.6,
+        height,
+        facecolor=color,
+        edgecolor=color,
+        alpha=alpha,
+        linestyle=linestyle
+    )
+
+    ax.add_patch(rectangle)
+
+
+# =========================================================
+# CREATE SIGNAL IMAGE
+# =========================================================
+
+def create_signal_chart(signal):
+
+    candles = signal["candles"]
+
+    previous = candles[-2]
+    last = candles[-1]
+
+    projected = build_projected_candle(
+        signal
+    )
+
+    fig, ax = plt.subplots(
+        figsize=(9, 6)
+    )
+
+    fig.patch.set_facecolor("#111111")
+    ax.set_facecolor("#111111")
+
+    draw_candle(ax, 0, previous)
+
+    draw_candle(ax, 1, last)
+
+    draw_candle(
+        ax,
+        2,
+        projected,
+        alpha=0.5,
+        linestyle="--"
+    )
+
+    ax.set_xticks([0, 1, 2])
+
+    ax.set_xticklabels(
+        [
+            "PREVIOUS",
+            "LAST CANDLE",
+            "NEXT TRADE"
+        ],
+        color="white"
+    )
+
+    ax.tick_params(
+        axis="y",
+        colors="white"
+    )
+
+    for spine in ax.spines.values():
+        spine.set_color("#666666")
+
+    ax.grid(
+        True,
+        linestyle=":",
+        alpha=0.25
+    )
+
+    ax.set_title(
+        "LAST 2 MARKET CANDLES + NEXT TRADE SETUP",
+        color="white",
+        fontsize=14,
+        fontweight="bold"
+    )
+
+    prices = [
+        previous["low"],
+        previous["high"],
+        last["low"],
+        last["high"],
+        projected["low"],
+        projected["high"]
+    ]
+
+    padding = (
+        max(prices)
+        - min(prices)
+    ) * 0.2
+
+    ax.set_ylim(
+        min(prices) - padding,
+        max(prices) + padding
+    )
+
+    filename = (
+        f"{CHART_DIR}/signal_"
+        f"{int(time.time())}.png"
+    )
+
+    plt.tight_layout()
+
+    plt.savefig(
+        filename,
+        dpi=150
+    )
+
+    plt.close()
+
+    return filename, projected
+
+
+# =========================================================
+# CAPTION
+# =========================================================
+
+def make_caption(
+    signal,
+    projected
+):
+
+    emoji = (
+        "🟢"
+        if signal["signal"] == "CALL"
+        else "🔴"
+    )
+
+    reasons = "\n".join(
+        f"• {x}"
+        for x in signal["reasons"]
     )
 
     return f"""
-<b>👑 {BOT_NAME}</b>
+👑 <b>{BOT_NAME}</b>
 
-━━━━━━━━━━━━━━━━━━
+🏆 <b>BEST SINGLE SIGNAL</b>
 
-{direction}
+🌐 <b>MARKET:</b> {signal["market"]}
 
-💱 Pair: <b>{signal["pair"]}</b>
+💱 <b>PAIR:</b> {signal["pair"]}
 
-⏱ Timeframe: <b>{TIMEFRAME}</b>
-⌛ Expiry: <b>{EXPIRY}</b>
+{emoji} <b>DIRECTION:</b> {signal["signal"]}
 
-📊 Indicator Agreement:
-<b>{signal["agreement"]}%</b>
+📊 <b>CONFIDENCE:</b> {signal["confidence"]}%
 
-🧠 Score:
-<b>{signal["score"]}/5</b>
+⭐ <b>SCORE:</b> {signal["score"]}/5
 
-💰 Price:
-<b>{signal["price"]:.5f}</b>
+⏱ <b>TIMEFRAME:</b> {TIMEFRAME}
 
-📈 EMA 9:
-<b>{signal["ema9"]:.5f}</b>
+⌛ <b>EXPIRY:</b> {EXPIRY}
 
-📉 EMA 21:
-<b>{signal["ema21"]:.5f}</b>
+━━━━━━━━━━━━━━━━
 
-📊 RSI:
-<b>{signal["rsi"]:.2f}</b>
+🎯 <b>TRADE:</b> NEXT CANDLE
 
-<b>🔎 Analysis</b>
+💰 <b>ENTRY:</b> {projected["open"]:.5f}
+
+📈 <b>PROJECTED HIGH:</b> {projected["high"]:.5f}
+
+📉 <b>PROJECTED LOW:</b> {projected["low"]:.5f}
+
+━━━━━━━━━━━━━━━━
+
+🔎 <b>ANALYSIS:</b>
+
 {reasons}
 
-🕐 Signal Time:
-<b>{now}</b>
+━━━━━━━━━━━━━━━━
 
-━━━━━━━━━━━━━━━━━━
-
-⚠️ <i>Analysis signal only.
-No signal guarantees profit.</i>
+⚠️ <i>Technical analysis only. No trade or profit is guaranteed.</i>
 """
 
 
@@ -592,341 +1034,79 @@ No signal guarantees profit.</i>
 
 def signal_engine():
 
-    print("=" * 45)
-    print(f"{BOT_NAME} Signal Engine Started")
-    print("=" * 45)
+    global last_sent_key
+    global last_sent_time
 
     while True:
 
         try:
 
             if not subscribers:
+
                 time.sleep(10)
                 continue
 
-            print("Starting market analysis...")
+            best = get_best_signal()
 
-            for pair_name, yahoo_symbol in PAIRS.items():
+            if not best:
 
-                print(f"Analyzing {pair_name}...")
+                print("No strong signal.")
 
-                result = analyze_pair(
-                    pair_name,
-                    yahoo_symbol
+                time.sleep(
+                    ANALYSIS_INTERVAL
                 )
 
-                if result is None:
-                    continue
-
-                signal_key = (
-                    result["signal"],
-                    round(result["price"], 5)
-                )
-
-                if last_signal.get(pair_name) == signal_key:
-                    continue
-
-                last_signal[pair_name] = signal_key
-
-                message = make_signal_message(result)
-
-                for chat_id in list(subscribers):
-
-                    try:
-                        send_message(chat_id, message)
-
-                    except Exception as e:
-                        print(
-                            f"Message error for {chat_id}: {e}"
-                        )
-
-                print(
-                    f"SIGNAL: {pair_name} "
-                    f"{result['signal']} "
-                    f"{result['score']}/5"
-                )
-
-                time.sleep(1)
-
-            print("Analysis cycle completed.")
-
-            time.sleep(45)
-
-        except Exception as e:
-
-            print("Signal engine error:", e)
-
-            time.sleep(15)
-
-
-# =========================================================
-# TELEGRAM LISTENER
-# =========================================================
-
-def telegram_listener():
-
-    print("=" * 45)
-    print("Telegram Listener Started")
-    print("=" * 45)
-
-    offset = None
-
-    while True:
-
-        try:
-
-            params = {
-                "timeout": 25
-            }
-
-            if offset is not None:
-                params["offset"] = offset
-
-            result = telegram_request(
-                "getUpdates",
-                params,
-                request_type="get"
-            )
-
-            if not result.get("ok"):
-                time.sleep(5)
                 continue
 
-            updates = result.get("result", [])
+            key = (
+                best["market"],
+                best["pair"],
+                best["signal"],
+                round(best["price"], 5)
+            )
 
-            for update in updates:
+            now = time.time()
 
-                offset = update["update_id"] + 1
+            if (
+                key == last_sent_key
+                and now - last_sent_time
+                < ANALYSIS_INTERVAL
+            ):
 
-                message = update.get("message")
-
-                if not message:
-                    continue
-
-                chat_id = message["chat"]["id"]
-
-                text = (
-                    message.get("text", "")
-                    .strip()
-                    .lower()
+                time.sleep(
+                    ANALYSIS_INTERVAL
                 )
 
-                print(
-                    f"Message from {chat_id}: {text}"
+                continue
+
+            path, projected = (
+                create_signal_chart(best)
+            )
+
+            caption = make_caption(
+                best,
+                projected
+            )
+
+            for chat_id in list(subscribers):
+
+                send_photo(
+                    chat_id,
+                    path,
+                    caption
                 )
 
-                # START
-                if text == "/start":
+            last_sent_key = key
+            last_sent_time = now
 
-                    subscribers.add(chat_id)
+            if os.path.exists(path):
+                os.remove(path)
 
-                    send_message(
-                        chat_id,
-                        f"""
-<b>👑 {BOT_NAME}</b>
-
-✅ Bot successfully activated!
-
-📊 Automatic signal analysis is ON.
-
-⏱ Timeframe: <b>{TIMEFRAME}</b>
-⌛ Expiry: <b>{EXPIRY}</b>
-
-<b>Commands:</b>
-
-/start - Start automatic signals
-/stop - Stop automatic signals
-/signal - Get current analysis
-/pairs - Show available pairs
-/status - Bot status
-
-━━━━━━━━━━━━━━━━━━
-
-⚠️ <i>Analysis signal only.
-No signal guarantees profit.</i>
-"""
-                    )
-
-                # STOP
-                elif text == "/stop":
-
-                    subscribers.discard(chat_id)
-
-                    send_message(
-                        chat_id,
-                        "🛑 Automatic signals stopped."
-                    )
-
-                # PAIRS
-                elif text == "/pairs":
-
-                    pair_list = "\n".join(
-                        f"• {pair}"
-                        for pair in PAIRS
-                    )
-
-                    send_message(
-                        chat_id,
-                        f"""
-<b>📊 Available Forex Pairs</b>
-
-{pair_list}
-"""
-                    )
-
-                # STATUS
-                elif text == "/status":
-
-                    active = (
-                        "ON 🟢"
-                        if chat_id in subscribers
-                        else "OFF 🔴"
-                    )
-
-                    send_message(
-                        chat_id,
-                        f"""
-<b>👑 {BOT_NAME}</b>
-
-🤖 Bot: <b>ONLINE</b>
-📡 Signals: <b>{active}</b>
-⏱ Timeframe: <b>{TIMEFRAME}</b>
-⌛ Expiry: <b>{EXPIRY}</b>
-📊 Pairs: <b>{len(PAIRS)}</b>
-
-🟢 Telegram connection: ACTIVE
-"""
-                    )
-
-                # MANUAL SIGNAL
-                elif text == "/signal":
-
-                    send_message(
-                        chat_id,
-                        "🔎 Market analysis started..."
-                    )
-
-                    found = False
-
-                    for pair_name, yahoo_symbol in PAIRS.items():
-
-                        result = analyze_pair(
-                            pair_name,
-                            yahoo_symbol
-                        )
-
-                        if result:
-
-                            send_message(
-                                chat_id,
-                                make_signal_message(result)
-                            )
-
-                            found = True
-                            break
-
-                    if not found:
-
-                        send_message(
-                            chat_id,
-                            """
-⚠️ No strong signal found right now.
-
-Please wait for stronger indicator agreement.
-"""
-                        )
-
-                # UNKNOWN COMMAND
-                elif text.startswith("/"):
-
-                    send_message(
-                        chat_id,
-                        """
-❓ Unknown command.
-
-Use:
-
-/start
-/stop
-/signal
-/pairs
-/status
-"""
-                    )
+            time.sleep(
+                ANALYSIS_INTERVAL
+            )
 
         except Exception as e:
 
-            print("Telegram listener error:", e)
-
-            time.sleep(10)
-
-
-# =========================================================
-# START BACKGROUND SERVICES
-# =========================================================
-
-def start_background_services():
-
-    global telegram_started
-
-    if telegram_started:
-        return
-
-    telegram_started = True
-
-    if not TELEGRAM_TOKEN:
-
-        print("=" * 45)
-        print("ERROR: TELEGRAM_TOKEN is NOT set!")
-        print("=" * 45)
-
-        return
-
-    print("Telegram token detected.")
-
-    if not test_telegram():
-
-        print("Telegram services were NOT started.")
-        return
-
-    remove_webhook()
-
-    listener_thread = threading.Thread(
-        target=telegram_listener,
-        daemon=True
-    )
-
-    engine_thread = threading.Thread(
-        target=signal_engine,
-        daemon=True
-    )
-
-    listener_thread.start()
-    engine_thread.start()
-
-
-# =========================================================
-# MAIN
-# =========================================================
-
-if __name__ == "__main__":
-
-    print("")
-    print("=" * 45)
-    print(f"Starting {BOT_NAME}")
-    print("=" * 45)
-
-    start_background_services()
-
-    port = int(
-        os.environ.get("PORT", 10000)
-    )
-
-    print(f"Starting Flask server on port {port}")
-
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=False,
-        use_reloader=False
-            ) 
+            print(
+                "Engine error:"
