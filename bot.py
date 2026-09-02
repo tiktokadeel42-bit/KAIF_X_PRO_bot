@@ -66,24 +66,7 @@ def send_message(chat_id, text):
 # MARKET DATA
 # =========================
 
-def get_candles(symbol):
-    url = "https://api.twelvedata.com/time_series"
-
-    params = {
-        "symbol": symbol,
-        "interval": INTERVAL,
-        "outputsize": 100,
-        "apikey": TWELVE_DATA_KEY,
-        "format": "JSON"
-    }
-
-    try:
-        r = requests.get(url, params=params, timeout=20)
-        data = r.json()
-
-        if "values" not in data:
-            print("Market data error:", data)
-            return []
+1000
 
         values = data["values"]
 
