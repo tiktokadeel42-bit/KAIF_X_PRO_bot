@@ -1211,6 +1211,7 @@ def signal_engine():
                 for chat_id in list(subscribers):
 
                     send_photo(
-                        chat_id,
-                        path,
-    
+    chat_id,
+    path,
+    caption
+)
