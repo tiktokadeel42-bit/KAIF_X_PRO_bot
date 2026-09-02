@@ -13,7 +13,6 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 BOT_NAME = "KAIF X PRO"
 
-# Normal forex pairs
 PAIRS = {
     "EUR/USD": "EURUSD=X",
     "GBP/USD": "GBPUSD=X",
@@ -30,13 +29,9 @@ PAIRS = {
 TIMEFRAME = "1m"
 EXPIRY = "1 Minute"
 
-# Strong signal ke liye minimum score
 MIN_SCORE = 4
 
-# Telegram subscribers
 subscribers = set()
-
-# Last sent signal
 last_signal = {}
 
 
@@ -58,30 +53,51 @@ def health():
 
 
 # =========================================================
-# TELEGRAM
+# TELEGRAM REQUEST
 # =========================================================
 
 def telegram_request(method, data=None):
 
     if not TELEGRAM_TOKEN:
-        print("ERROR: TELEGRAM_TOKEN missing")
+        print("ERROR: TELEGRAM_TOKEN is missing.")
         return {}
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_TOKEN}/{method}"
+    )
 
     try:
+
         response = requests.post(
             url,
             json=data or {},
             timeout=30
         )
 
-        return response.json()
+        result = response.json()
+
+        if not result.get("ok"):
+            print(
+                f"Telegram API error ({method}):",
+                result
+            )
+
+        return result
 
     except Exception as e:
-        print("Telegram error:", e)
+
+        print(
+            f"Telegram request error ({method}):",
+            e
+        )
+
         return {}
 
+
+# =========================================================
+# SEND MESSAGE
+# =========================================================
 
 def send_message(chat_id, text):
 
@@ -93,6 +109,79 @@ def send_message(chat_id, text):
             "parse_mode": "HTML"
         }
     )
+
+
+# =========================================================
+# TELEGRAM CONNECTION TEST
+# =========================================================
+
+def test_telegram():
+
+    print("--------------------------------")
+    print("Testing Telegram connection...")
+    print("--------------------------------")
+
+    result = telegram_request("getMe")
+
+    if result.get("ok"):
+
+        bot = result.get("result", {})
+
+        print(
+            "Telegram connected successfully."
+        )
+
+        print(
+            "Bot username:",
+            bot.get("username")
+        )
+
+        print(
+            "Bot name:",
+            bot.get("first_name")
+        )
+
+        return True
+
+    print(
+        "Telegram connection FAILED."
+    )
+
+    print(
+        "Please check TELEGRAM_TOKEN."
+    )
+
+    return False
+
+
+# =========================================================
+# REMOVE WEBHOOK
+# =========================================================
+
+def remove_webhook():
+
+    print("--------------------------------")
+    print("Removing Telegram webhook...")
+    print("--------------------------------")
+
+    result = telegram_request(
+        "deleteWebhook",
+        {
+            "drop_pending_updates": True
+        }
+    )
+
+    if result.get("ok"):
+
+        print(
+            "Telegram webhook removed successfully."
+        )
+
+    else:
+
+        print(
+            "Could not remove Telegram webhook."
+        )
 
 
 # =========================================================
@@ -124,21 +213,59 @@ def get_candles(symbol):
             timeout=20
         )
 
-        data = response.json()
+        if response.status_code != 200:
 
-        chart = data.get("chart", {})
-        result = chart.get("result")
+            print(
+                "Yahoo HTTP error:",
+                symbol,
+                response.status_code
+            )
 
-        if not result:
-            print("No market data:", symbol)
             return []
 
-        quote = result[0]["indicators"]["quote"][0]
+        data = response.json()
 
-        opens = quote.get("open", [])
-        highs = quote.get("high", [])
-        lows = quote.get("low", [])
-        closes = quote.get("close", [])
+        chart = data.get(
+            "chart",
+            {}
+        )
+
+        result = chart.get(
+            "result"
+        )
+
+        if not result:
+
+            print(
+                "No market data:",
+                symbol
+            )
+
+            return []
+
+        quote = result[0][
+            "indicators"
+        ]["quote"][0]
+
+        opens = quote.get(
+            "open",
+            []
+        )
+
+        highs = quote.get(
+            "high",
+            []
+        )
+
+        lows = quote.get(
+            "low",
+            []
+        )
+
+        closes = quote.get(
+            "close",
+            []
+        )
 
         candles = []
 
@@ -159,18 +286,24 @@ def get_candles(symbol):
             ):
                 continue
 
-            candles.append({
-                "open": float(opens[i]),
-                "high": float(highs[i]),
-                "low": float(lows[i]),
-                "close": float(closes[i])
-            })
+            candles.append(
+                {
+                    "open": float(opens[i]),
+                    "high": float(highs[i]),
+                    "low": float(lows[i]),
+                    "close": float(closes[i])
+                }
+            )
 
         return candles
 
     except Exception as e:
 
-        print("Market data error:", symbol, e)
+        print(
+            "Market data error:",
+            symbol,
+            e
+        )
 
         return []
 
@@ -186,11 +319,15 @@ def calculate_ema(values, period):
 
     multiplier = 2 / (period + 1)
 
-    ema_value = sum(values[:period]) / period
+    ema_value = (
+        sum(values[:period]) / period
+    )
 
     for price in values[period:]:
+
         ema_value = (
-            (price - ema_value) * multiplier
+            (price - ema_value)
+            * multiplier
             + ema_value
         )
 
@@ -211,33 +348,53 @@ def calculate_rsi(values, period=14):
 
     for i in range(1, period + 1):
 
-        change = values[i] - values[i - 1]
+        change = (
+            values[i] - values[i - 1]
+        )
 
         if change > 0:
+
             gains.append(change)
             losses.append(0)
 
         else:
+
             gains.append(0)
             losses.append(abs(change))
 
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
+    avg_gain = (
+        sum(gains) / period
+    )
 
-    for i in range(period + 1, len(values)):
+    avg_loss = (
+        sum(losses) / period
+    )
 
-        change = values[i] - values[i - 1]
+    for i in range(
+        period + 1,
+        len(values)
+    ):
+
+        change = (
+            values[i] - values[i - 1]
+        )
 
         gain = max(change, 0)
         loss = max(-change, 0)
 
         avg_gain = (
-            (avg_gain * (period - 1) + gain)
+            (
+                avg_gain * (period - 1)
+                + gain
+            )
             / period
         )
 
         avg_loss = (
-            (avg_loss * (period - 1) + loss)
+            (
+                avg_loss * (period - 1)
+                + loss
+            )
             / period
         )
 
@@ -246,33 +403,54 @@ def calculate_rsi(values, period=14):
 
     rs = avg_gain / avg_loss
 
-    return 100 - (100 / (1 + rs))
+    return 100 - (
+        100 / (1 + rs)
+    )
 
 
 # =========================================================
 # BOLLINGER BANDS
 # =========================================================
 
-def calculate_bollinger(values, period=20):
+def calculate_bollinger(
+    values,
+    period=20
+):
 
     if len(values) < period:
+
         return None, None, None
 
     recent = values[-period:]
 
-    middle = sum(recent) / period
+    middle = (
+        sum(recent) / period
+    )
 
     variance = sum(
         (price - middle) ** 2
         for price in recent
     ) / period
 
-    standard_deviation = variance ** 0.5
+    standard_deviation = (
+        variance ** 0.5
+    )
 
-    upper = middle + (2 * standard_deviation)
-    lower = middle - (2 * standard_deviation)
+    upper = (
+        middle
+        + 2 * standard_deviation
+    )
 
-    return upper, middle, lower
+    lower = (
+        middle
+        - 2 * standard_deviation
+    )
+
+    return (
+        upper,
+        middle,
+        lower
+    )
 
 
 # =========================================================
@@ -282,24 +460,39 @@ def calculate_bollinger(values, period=20):
 def calculate_macd(values):
 
     if len(values) < 35:
+
         return None, None
 
     macd_values = []
 
-    for i in range(26, len(values) + 1):
+    for i in range(
+        26,
+        len(values) + 1
+    ):
 
         section = values[:i]
 
-        ema12 = calculate_ema(section, 12)
-        ema26 = calculate_ema(section, 26)
+        ema12 = calculate_ema(
+            section,
+            12
+        )
 
-        if ema12 is not None and ema26 is not None:
+        ema26 = calculate_ema(
+            section,
+            26
+        )
+
+        if (
+            ema12 is not None
+            and ema26 is not None
+        ):
 
             macd_values.append(
                 ema12 - ema26
             )
 
     if len(macd_values) < 9:
+
         return None, None
 
     macd_line = macd_values[-1]
@@ -309,7 +502,10 @@ def calculate_macd(values):
         9
     )
 
-    return macd_line, signal_line
+    return (
+        macd_line,
+        signal_line
+    )
 
 
 # =========================================================
@@ -319,9 +515,11 @@ def calculate_macd(values):
 def candle_direction(candle):
 
     if candle["close"] > candle["open"]:
+
         return "bullish"
 
     if candle["close"] < candle["open"]:
+
         return "bearish"
 
     return "neutral"
@@ -331,14 +529,20 @@ def candle_direction(candle):
 # SIGNAL ANALYSIS
 # =========================================================
 
-def analyze_pair(pair_name, yahoo_symbol):
+def analyze_pair(
+    pair_name,
+    yahoo_symbol
+):
 
-    candles = get_candles(yahoo_symbol)
+    candles = get_candles(
+        yahoo_symbol
+    )
 
     if len(candles) < 40:
 
         print(
-            f"{pair_name}: not enough candles"
+            f"{pair_name}: "
+            f"not enough candles"
         )
 
         return None
@@ -350,18 +554,32 @@ def analyze_pair(pair_name, yahoo_symbol):
 
     current_price = closes[-1]
 
-    ema9 = calculate_ema(closes, 9)
-    ema21 = calculate_ema(closes, 21)
-
-    rsi = calculate_rsi(closes, 14)
-
-    upper, middle, lower = calculate_bollinger(
+    ema9 = calculate_ema(
         closes,
-        20
+        9
     )
 
-    macd_line, macd_signal = calculate_macd(
-        closes
+    ema21 = calculate_ema(
+        closes,
+        21
+    )
+
+    rsi = calculate_rsi(
+        closes,
+        14
+    )
+
+    upper, middle, lower = (
+        calculate_bollinger(
+            closes,
+            20
+        )
+    )
+
+    macd_line, macd_signal = (
+        calculate_macd(
+            closes
+        )
     )
 
     if any(
@@ -386,9 +604,9 @@ def analyze_pair(pair_name, yahoo_symbol):
     call_reasons = []
     put_reasons = []
 
-    # -----------------------------------------------------
+    # =====================================================
     # EMA TREND
-    # -----------------------------------------------------
+    # =====================================================
 
     if ema9 > ema21:
 
@@ -406,9 +624,9 @@ def analyze_pair(pair_name, yahoo_symbol):
             "EMA 9 below EMA 21"
         )
 
-    # -----------------------------------------------------
+    # =====================================================
     # RSI
-    # -----------------------------------------------------
+    # =====================================================
 
     if 50 < rsi < 70:
 
@@ -426,9 +644,9 @@ def analyze_pair(pair_name, yahoo_symbol):
             "RSI bearish zone"
         )
 
-    # -----------------------------------------------------
+    # =====================================================
     # MACD
-    # -----------------------------------------------------
+    # =====================================================
 
     if macd_line > macd_signal:
 
@@ -446,9 +664,9 @@ def analyze_pair(pair_name, yahoo_symbol):
             "MACD bearish"
         )
 
-    # -----------------------------------------------------
+    # =====================================================
     # BOLLINGER
-    # -----------------------------------------------------
+    # =====================================================
 
     if current_price > middle:
 
@@ -466,9 +684,9 @@ def analyze_pair(pair_name, yahoo_symbol):
             "Price below Bollinger middle"
         )
 
-    # -----------------------------------------------------
+    # =====================================================
     # CANDLE MOMENTUM
-    # -----------------------------------------------------
+    # =====================================================
 
     last_candle = candles[-1]
 
@@ -492,9 +710,9 @@ def analyze_pair(pair_name, yahoo_symbol):
             "Last candle bearish"
         )
 
-    # -----------------------------------------------------
+    # =====================================================
     # SIGNAL DECISION
-    # -----------------------------------------------------
+    # =====================================================
 
     if (
         call_score >= MIN_SCORE
@@ -517,9 +735,6 @@ def analyze_pair(pair_name, yahoo_symbol):
     else:
 
         return None
-
-    # Score ko confidence percentage na samjhein.
-    # Ye sirf indicator agreement score hai.
 
     agreement = int(
         (score / 5) * 100
@@ -615,7 +830,9 @@ No signal guarantees profit.</i>
 def signal_engine():
 
     print("================================")
-    print(f"{BOT_NAME} signal engine started")
+    print(
+        f"{BOT_NAME} signal engine started"
+    )
     print("================================")
 
     while True:
@@ -627,6 +844,10 @@ def signal_engine():
                 time.sleep(10)
 
                 continue
+
+            print(
+                "Starting market analysis..."
+            )
 
             for pair_name, yahoo_symbol in PAIRS.items():
 
@@ -643,23 +864,36 @@ def signal_engine():
 
                     continue
 
-                # Prevent duplicate signal
                 signal_key = (
                     result["signal"],
-                    round(result["price"], 5)
+                    round(
+                        result["price"],
+                        5
+                    )
                 )
 
-                if last_signal.get(pair_name) == signal_key:
+                if (
+                    last_signal.get(
+                        pair_name
+                    )
+                    == signal_key
+                ):
 
                     continue
 
-                last_signal[pair_name] = signal_key
+                last_signal[
+                    pair_name
+                ] = signal_key
 
-                message = make_signal_message(
-                    result
+                message = (
+                    make_signal_message(
+                        result
+                    )
                 )
 
-                for chat_id in list(subscribers):
+                for chat_id in list(
+                    subscribers
+                ):
 
                     send_message(
                         chat_id,
@@ -667,14 +901,18 @@ def signal_engine():
                     )
 
                 print(
-                    f"SIGNAL: {pair_name} "
+                    f"SIGNAL: "
+                    f"{pair_name} "
                     f"{result['signal']} "
                     f"{result['score']}/5"
                 )
 
                 time.sleep(2)
 
-            # Approximately one-minute cycle
+            print(
+                "Analysis cycle completed."
+            )
+
             time.sleep(45)
 
         except Exception as e:
@@ -688,12 +926,14 @@ def signal_engine():
 
 
 # =========================================================
-# TELEGRAM UPDATE HANDLER
+# TELEGRAM LISTENER
 # =========================================================
 
 def telegram_listener():
 
+    print("================================")
     print("Telegram listener started")
+    print("================================")
 
     offset = None
 
@@ -718,13 +958,35 @@ def telegram_listener():
 
             data = response.json()
 
-            for update in data.get(
+            # =================================================
+            # CHECK TELEGRAM RESPONSE
+            # =================================================
+
+            if not data.get("ok"):
+
+                print(
+                    "Telegram getUpdates error:",
+                    data
+                )
+
+                time.sleep(5)
+
+                continue
+
+            # =================================================
+            # PROCESS UPDATES
+            # =================================================
+
+            updates = data.get(
                 "result",
                 []
-            ):
+            )
+
+            for update in updates:
 
                 offset = (
-                    update["update_id"] + 1
+                    update["update_id"]
+                    + 1
                 )
 
                 message = update.get(
@@ -735,20 +997,32 @@ def telegram_listener():
 
                     continue
 
-                chat_id = message["chat"]["id"]
+                chat_id = message[
+                    "chat"
+                ]["id"]
 
                 text = message.get(
                     "text",
                     ""
                 ).strip()
 
-                # -----------------------------------------
+                print(
+                    f"Telegram message "
+                    f"from {chat_id}: {text}"
+                )
+
+                # =================================================
                 # START
-                # -----------------------------------------
+                # =================================================
 
                 if text == "/start":
 
                     subscribers.add(
+                        chat_id
+                    )
+
+                    print(
+                        "Subscriber added:",
                         chat_id
                     )
 
@@ -771,12 +1045,17 @@ def telegram_listener():
 /signal - Get current analysis
 /pairs - Show available pairs
 /status - Bot status
+
+━━━━━━━━━━━━━━━━━━
+
+⚠️ <i>Analysis signal only.
+No signal guarantees profit.</i>
 """
                     )
 
-                # -----------------------------------------
+                # =================================================
                 # STOP
-                # -----------------------------------------
+                # =================================================
 
                 elif text == "/stop":
 
@@ -784,155 +1063,4 @@ def telegram_listener():
                         chat_id
                     )
 
-                    send_message(
-                        chat_id,
-                        "🛑 Automatic signals stopped."
-                    )
-
-                # -----------------------------------------
-                # PAIRS
-                # -----------------------------------------
-
-                elif text == "/pairs":
-
-                    pair_list = "\n".join(
-                        f"• {pair}"
-                        for pair in PAIRS
-                    )
-
-                    send_message(
-                        chat_id,
-                        f"""
-<b>📊 Available Forex Pairs</b>
-
-{pair_list}
-"""
-                    )
-
-                # -----------------------------------------
-                # STATUS
-                # -----------------------------------------
-
-                elif text == "/status":
-
-                    active = (
-                        "ON"
-                        if chat_id in subscribers
-                        else "OFF"
-                    )
-
-                    send_message(
-                        chat_id,
-                        f"""
-<b>👑 {BOT_NAME}</b>
-
-🤖 Bot: ONLINE
-📡 Signals: <b>{active}</b>
-⏱ Timeframe: 1 Minute
-⌛ Expiry: 1 Minute
-📊 Pairs: {len(PAIRS)}
-"""
-                    )
-
-                # -----------------------------------------
-                # MANUAL SIGNAL
-                # -----------------------------------------
-
-                elif text == "/signal":
-
-                    send_message(
-                        chat_id,
-                        "🔎 Market analysis started..."
-                    )
-
-                    found = False
-
-                    for pair_name, yahoo_symbol in PAIRS.items():
-
-                        result = analyze_pair(
-                            pair_name,
-                            yahoo_symbol
-                        )
-
-                        if result:
-
-                            send_message(
-                                chat_id,
-                                make_signal_message(
-                                    result
-                                )
-                            )
-
-                            found = True
-
-                            break
-
-                    if not found:
-
-                        send_message(
-                            chat_id,
-                            """
-⚠️ No strong signal found right now.
-
-Please wait for stronger indicator agreement.
-"""
-                        )
-
-        except Exception as e:
-
-            print(
-                "Telegram listener error:",
-                e
-            )
-
-            time.sleep(10)
-
-
-# =========================================================
-# MAIN
-# =========================================================
-
-if __name__ == "__main__":
-
-    print("Starting bot...")
-
-    if not TELEGRAM_TOKEN:
-
-        print(
-            "ERROR: TELEGRAM_TOKEN is not set."
-        )
-
-    else:
-
-        print(
-            "Telegram token detected."
-        )
-
-        # Telegram listener
-        threading.Thread(
-            target=telegram_listener,
-            daemon=True
-        ).start()
-
-        # Signal engine
-        threading.Thread(
-            target=signal_engine,
-            daemon=True
-        ).start()
-
-    # Render port
-    port = int(
-        os.environ.get(
-            "PORT",
-            10000
-        )
-    )
-
-    print(
-        f"Starting web server on port {port}"
-    )
-
-    app.run(
-        host="0.0.0.0",
-        port=port
-        )
+              
