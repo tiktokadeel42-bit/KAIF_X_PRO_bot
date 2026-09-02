@@ -1058,4 +1058,4 @@ def start_bot():
     try:
 
         response = requests.get(
-            f"{TELEGRAM_
+            TELEGRAM_TOKEN = ""
