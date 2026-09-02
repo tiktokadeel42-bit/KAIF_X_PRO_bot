@@ -1,17 +1,19 @@
 import os
 import time
 import threading
-import requests
 from datetime import datetime
+
+import requests
 from flask import Flask
+
 
 # =========================================================
 # CONFIG
 # =========================================================
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-
 BOT_NAME = "KAIF X PRO"
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 PAIRS = {
     "EUR/USD": "EURUSD=X",
@@ -23,20 +25,22 @@ PAIRS = {
     "NZD/USD": "NZDUSD=X",
     "EUR/JPY": "EURJPY=X",
     "GBP/JPY": "GBPJPY=X",
-    "EUR/GBP": "EURGBP=X"
+    "EUR/GBP": "EURGBP=X",
 }
 
-TIMEFRAME = "1m"
+TIMEFRAME = "1 Minute"
 EXPIRY = "1 Minute"
-
 MIN_SCORE = 4
 
 subscribers = set()
 last_signal = {}
 
+# Prevent multiple listener threads
+telegram_started = False
+
 
 # =========================================================
-# FLASK SERVER FOR RENDER
+# FLASK SERVER
 # =========================================================
 
 app = Flask(__name__)
@@ -44,54 +48,59 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return f"{BOT_NAME} Telegram Signal Bot is running."
+    return f"""
+    <h2>👑 {BOT_NAME}</h2>
+    <p>Telegram Signal Bot is running.</p>
+    """
 
 
 @app.route("/health")
 def health():
-    return "OK"
+    return "OK", 200
 
 
 # =========================================================
-# TELEGRAM REQUEST
+# TELEGRAM API
 # =========================================================
 
-def telegram_request(method, data=None):
+def telegram_request(method, data=None, request_type="post"):
 
     if not TELEGRAM_TOKEN:
         print("ERROR: TELEGRAM_TOKEN is missing.")
         return {}
 
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_TOKEN}/{method}"
-    )
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
 
     try:
 
-        response = requests.post(
-            url,
-            json=data or {},
-            timeout=30
-        )
+        if request_type == "get":
+            response = requests.get(
+                url,
+                params=data or {},
+                timeout=35
+            )
+        else:
+            response = requests.post(
+                url,
+                json=data or {},
+                timeout=30
+            )
+
+        response.raise_for_status()
 
         result = response.json()
 
         if not result.get("ok"):
-            print(
-                f"Telegram API error ({method}):",
-                result
-            )
+            print(f"Telegram API error [{method}]:", result)
 
         return result
 
-    except Exception as e:
+    except requests.exceptions.RequestException as e:
+        print(f"Telegram request error [{method}]:", e)
+        return {}
 
-        print(
-            f"Telegram request error ({method}):",
-            e
-        )
-
+    except ValueError:
+        print(f"Invalid Telegram response [{method}]")
         return {}
 
 
@@ -106,20 +115,20 @@ def send_message(chat_id, text):
         {
             "chat_id": chat_id,
             "text": text,
-            "parse_mode": "HTML"
+            "parse_mode": "HTML",
         }
     )
 
 
 # =========================================================
-# TELEGRAM CONNECTION TEST
+# TEST TELEGRAM
 # =========================================================
 
 def test_telegram():
 
-    print("--------------------------------")
+    print("=" * 45)
     print("Testing Telegram connection...")
-    print("--------------------------------")
+    print("=" * 45)
 
     result = telegram_request("getMe")
 
@@ -127,30 +136,13 @@ def test_telegram():
 
         bot = result.get("result", {})
 
-        print(
-            "Telegram connected successfully."
-        )
-
-        print(
-            "Bot username:",
-            bot.get("username")
-        )
-
-        print(
-            "Bot name:",
-            bot.get("first_name")
-        )
+        print("Telegram connected successfully!")
+        print("Bot username:", bot.get("username"))
+        print("Bot name:", bot.get("first_name"))
 
         return True
 
-    print(
-        "Telegram connection FAILED."
-    )
-
-    print(
-        "Please check TELEGRAM_TOKEN."
-    )
-
+    print("Telegram connection FAILED.")
     return False
 
 
@@ -160,9 +152,7 @@ def test_telegram():
 
 def remove_webhook():
 
-    print("--------------------------------")
     print("Removing Telegram webhook...")
-    print("--------------------------------")
 
     result = telegram_request(
         "deleteWebhook",
@@ -172,32 +162,22 @@ def remove_webhook():
     )
 
     if result.get("ok"):
-
-        print(
-            "Telegram webhook removed successfully."
-        )
-
+        print("Webhook removed successfully.")
     else:
-
-        print(
-            "Could not remove Telegram webhook."
-        )
+        print("Webhook removal failed.")
 
 
 # =========================================================
-# MARKET DATA
+# GET MARKET DATA
 # =========================================================
 
 def get_candles(symbol):
 
-    url = (
-        "https://query1.finance.yahoo.com/"
-        f"v8/finance/chart/{symbol}"
-    )
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 
     params = {
         "interval": "1m",
-        "range": "1d"
+        "range": "1d",
     }
 
     headers = {
@@ -214,58 +194,27 @@ def get_candles(symbol):
         )
 
         if response.status_code != 200:
-
             print(
-                "Yahoo HTTP error:",
-                symbol,
-                response.status_code
+                f"Yahoo error for {symbol}: "
+                f"{response.status_code}"
             )
-
             return []
 
         data = response.json()
 
-        chart = data.get(
-            "chart",
-            {}
-        )
-
-        result = chart.get(
-            "result"
-        )
+        chart = data.get("chart", {})
+        result = chart.get("result")
 
         if not result:
-
-            print(
-                "No market data:",
-                symbol
-            )
-
+            print(f"No market data for {symbol}")
             return []
 
-        quote = result[0][
-            "indicators"
-        ]["quote"][0]
+        quote = result[0]["indicators"]["quote"][0]
 
-        opens = quote.get(
-            "open",
-            []
-        )
-
-        highs = quote.get(
-            "high",
-            []
-        )
-
-        lows = quote.get(
-            "low",
-            []
-        )
-
-        closes = quote.get(
-            "close",
-            []
-        )
+        opens = quote.get("open", [])
+        highs = quote.get("high", [])
+        lows = quote.get("low", [])
+        closes = quote.get("close", [])
 
         candles = []
 
@@ -286,25 +235,17 @@ def get_candles(symbol):
             ):
                 continue
 
-            candles.append(
-                {
-                    "open": float(opens[i]),
-                    "high": float(highs[i]),
-                    "low": float(lows[i]),
-                    "close": float(closes[i])
-                }
-            )
+            candles.append({
+                "open": float(opens[i]),
+                "high": float(highs[i]),
+                "low": float(lows[i]),
+                "close": float(closes[i]),
+            })
 
         return candles
 
     except Exception as e:
-
-        print(
-            "Market data error:",
-            symbol,
-            e
-        )
-
+        print(f"Market data error for {symbol}: {e}")
         return []
 
 
@@ -319,19 +260,12 @@ def calculate_ema(values, period):
 
     multiplier = 2 / (period + 1)
 
-    ema_value = (
-        sum(values[:period]) / period
-    )
+    ema = sum(values[:period]) / period
 
     for price in values[period:]:
+        ema = ((price - ema) * multiplier) + ema
 
-        ema_value = (
-            (price - ema_value)
-            * multiplier
-            + ema_value
-        )
-
-    return ema_value
+    return ema
 
 
 # =========================================================
@@ -348,53 +282,28 @@ def calculate_rsi(values, period=14):
 
     for i in range(1, period + 1):
 
-        change = (
-            values[i] - values[i - 1]
-        )
+        change = values[i] - values[i - 1]
 
-        if change > 0:
+        gains.append(max(change, 0))
+        losses.append(max(-change, 0))
 
-            gains.append(change)
-            losses.append(0)
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
 
-        else:
+    for i in range(period + 1, len(values)):
 
-            gains.append(0)
-            losses.append(abs(change))
-
-    avg_gain = (
-        sum(gains) / period
-    )
-
-    avg_loss = (
-        sum(losses) / period
-    )
-
-    for i in range(
-        period + 1,
-        len(values)
-    ):
-
-        change = (
-            values[i] - values[i - 1]
-        )
+        change = values[i] - values[i - 1]
 
         gain = max(change, 0)
         loss = max(-change, 0)
 
         avg_gain = (
-            (
-                avg_gain * (period - 1)
-                + gain
-            )
+            (avg_gain * (period - 1) + gain)
             / period
         )
 
         avg_loss = (
-            (
-                avg_loss * (period - 1)
-                + loss
-            )
+            (avg_loss * (period - 1) + loss)
             / period
         )
 
@@ -403,54 +312,33 @@ def calculate_rsi(values, period=14):
 
     rs = avg_gain / avg_loss
 
-    return 100 - (
-        100 / (1 + rs)
-    )
+    return 100 - (100 / (1 + rs))
 
 
 # =========================================================
 # BOLLINGER BANDS
 # =========================================================
 
-def calculate_bollinger(
-    values,
-    period=20
-):
+def calculate_bollinger(values, period=20):
 
     if len(values) < period:
-
         return None, None, None
 
     recent = values[-period:]
 
-    middle = (
-        sum(recent) / period
-    )
+    middle = sum(recent) / period
 
     variance = sum(
         (price - middle) ** 2
         for price in recent
     ) / period
 
-    standard_deviation = (
-        variance ** 0.5
-    )
+    std = variance ** 0.5
 
-    upper = (
-        middle
-        + 2 * standard_deviation
-    )
+    upper = middle + (2 * std)
+    lower = middle - (2 * std)
 
-    lower = (
-        middle
-        - 2 * standard_deviation
-    )
-
-    return (
-        upper,
-        middle,
-        lower
-    )
+    return upper, middle, lower
 
 
 # =========================================================
@@ -460,91 +348,54 @@ def calculate_bollinger(
 def calculate_macd(values):
 
     if len(values) < 35:
-
         return None, None
 
     macd_values = []
 
-    for i in range(
-        26,
-        len(values) + 1
-    ):
+    for i in range(26, len(values) + 1):
 
         section = values[:i]
 
-        ema12 = calculate_ema(
-            section,
-            12
-        )
+        ema12 = calculate_ema(section, 12)
+        ema26 = calculate_ema(section, 26)
 
-        ema26 = calculate_ema(
-            section,
-            26
-        )
-
-        if (
-            ema12 is not None
-            and ema26 is not None
-        ):
-
-            macd_values.append(
-                ema12 - ema26
-            )
+        if ema12 is not None and ema26 is not None:
+            macd_values.append(ema12 - ema26)
 
     if len(macd_values) < 9:
-
         return None, None
 
     macd_line = macd_values[-1]
+    signal_line = calculate_ema(macd_values, 9)
 
-    signal_line = calculate_ema(
-        macd_values,
-        9
-    )
-
-    return (
-        macd_line,
-        signal_line
-    )
+    return macd_line, signal_line
 
 
 # =========================================================
-# CANDLE ANALYSIS
+# CANDLE DIRECTION
 # =========================================================
 
 def candle_direction(candle):
 
     if candle["close"] > candle["open"]:
-
         return "bullish"
 
     if candle["close"] < candle["open"]:
-
         return "bearish"
 
     return "neutral"
 
 
 # =========================================================
-# SIGNAL ANALYSIS
+# ANALYZE PAIR
 # =========================================================
 
-def analyze_pair(
-    pair_name,
-    yahoo_symbol
-):
+def analyze_pair(pair_name, yahoo_symbol):
 
-    candles = get_candles(
-        yahoo_symbol
-    )
+    candles = get_candles(yahoo_symbol)
 
     if len(candles) < 40:
-
-        print(
-            f"{pair_name}: "
-            f"not enough candles"
-        )
-
+        print(f"{pair_name}: Not enough candles")
         return None
 
     closes = [
@@ -554,48 +405,32 @@ def analyze_pair(
 
     current_price = closes[-1]
 
-    ema9 = calculate_ema(
+    ema9 = calculate_ema(closes, 9)
+    ema21 = calculate_ema(closes, 21)
+
+    rsi = calculate_rsi(closes, 14)
+
+    upper, middle, lower = calculate_bollinger(
         closes,
-        9
+        20
     )
 
-    ema21 = calculate_ema(
-        closes,
-        21
+    macd_line, macd_signal = calculate_macd(
+        closes
     )
 
-    rsi = calculate_rsi(
-        closes,
-        14
-    )
+    indicators = [
+        ema9,
+        ema21,
+        rsi,
+        upper,
+        middle,
+        lower,
+        macd_line,
+        macd_signal,
+    ]
 
-    upper, middle, lower = (
-        calculate_bollinger(
-            closes,
-            20
-        )
-    )
-
-    macd_line, macd_signal = (
-        calculate_macd(
-            closes
-        )
-    )
-
-    if any(
-        value is None
-        for value in [
-            ema9,
-            ema21,
-            rsi,
-            upper,
-            middle,
-            lower,
-            macd_line,
-            macd_signal
-        ]
-    ):
-
+    if any(value is None for value in indicators):
         return None
 
     call_score = 0
@@ -604,121 +439,58 @@ def analyze_pair(
     call_reasons = []
     put_reasons = []
 
-    # =====================================================
-    # EMA TREND
-    # =====================================================
-
+    # EMA
     if ema9 > ema21:
-
         call_score += 1
-
-        call_reasons.append(
-            "EMA 9 above EMA 21"
-        )
+        call_reasons.append("EMA 9 above EMA 21")
 
     elif ema9 < ema21:
-
         put_score += 1
+        put_reasons.append("EMA 9 below EMA 21")
 
-        put_reasons.append(
-            "EMA 9 below EMA 21"
-        )
-
-    # =====================================================
     # RSI
-    # =====================================================
-
     if 50 < rsi < 70:
-
         call_score += 1
-
-        call_reasons.append(
-            "RSI bullish zone"
-        )
+        call_reasons.append("RSI bullish zone")
 
     elif 30 < rsi < 50:
-
         put_score += 1
+        put_reasons.append("RSI bearish zone")
 
-        put_reasons.append(
-            "RSI bearish zone"
-        )
-
-    # =====================================================
     # MACD
-    # =====================================================
-
     if macd_line > macd_signal:
-
         call_score += 1
-
-        call_reasons.append(
-            "MACD bullish"
-        )
+        call_reasons.append("MACD bullish")
 
     elif macd_line < macd_signal:
-
         put_score += 1
+        put_reasons.append("MACD bearish")
 
-        put_reasons.append(
-            "MACD bearish"
-        )
-
-    # =====================================================
-    # BOLLINGER
-    # =====================================================
-
+    # Bollinger
     if current_price > middle:
-
         call_score += 1
-
-        call_reasons.append(
-            "Price above Bollinger middle"
-        )
+        call_reasons.append("Price above Bollinger middle")
 
     elif current_price < middle:
-
         put_score += 1
+        put_reasons.append("Price below Bollinger middle")
 
-        put_reasons.append(
-            "Price below Bollinger middle"
-        )
-
-    # =====================================================
-    # CANDLE MOMENTUM
-    # =====================================================
-
-    last_candle = candles[-1]
-
-    direction = candle_direction(
-        last_candle
-    )
+    # Last candle
+    direction = candle_direction(candles[-1])
 
     if direction == "bullish":
-
         call_score += 1
-
-        call_reasons.append(
-            "Last candle bullish"
-        )
+        call_reasons.append("Last candle bullish")
 
     elif direction == "bearish":
-
         put_score += 1
+        put_reasons.append("Last candle bearish")
 
-        put_reasons.append(
-            "Last candle bearish"
-        )
-
-    # =====================================================
-    # SIGNAL DECISION
-    # =====================================================
-
+    # Signal decision
     if (
         call_score >= MIN_SCORE
         and call_score > put_score
     ):
-
         signal = "CALL"
         score = call_score
         reasons = call_reasons
@@ -727,18 +499,14 @@ def analyze_pair(
         put_score >= MIN_SCORE
         and put_score > call_score
     ):
-
         signal = "PUT"
         score = put_score
         reasons = put_reasons
 
     else:
-
         return None
 
-    agreement = int(
-        (score / 5) * 100
-    )
+    agreement = int((score / 5) * 100)
 
     return {
         "pair": pair_name,
@@ -751,7 +519,7 @@ def analyze_pair(
         "ema21": ema21,
         "macd": macd_line,
         "macd_signal": macd_signal,
-        "reasons": reasons
+        "reasons": reasons,
     }
 
 
@@ -762,15 +530,12 @@ def analyze_pair(
 def make_signal_message(signal):
 
     if signal["signal"] == "CALL":
-
         direction = "🟢 CALL / UP"
-
     else:
-
         direction = "🔴 PUT / DOWN"
 
     reasons = "\n".join(
-        "• " + reason
+        f"• {reason}"
         for reason in signal["reasons"]
     )
 
@@ -778,7 +543,7 @@ def make_signal_message(signal):
         "%Y-%m-%d %H:%M:%S"
     )
 
-    message = f"""
+    return f"""
 <b>👑 {BOT_NAME}</b>
 
 ━━━━━━━━━━━━━━━━━━
@@ -787,7 +552,7 @@ def make_signal_message(signal):
 
 💱 Pair: <b>{signal["pair"]}</b>
 
-⏱ Timeframe: <b>1 Minute</b>
+⏱ Timeframe: <b>{TIMEFRAME}</b>
 ⌛ Expiry: <b>{EXPIRY}</b>
 
 📊 Indicator Agreement:
@@ -811,7 +576,7 @@ def make_signal_message(signal):
 <b>🔎 Analysis</b>
 {reasons}
 
-🕐 Signal:
+🕐 Signal Time:
 <b>{now}</b>
 
 ━━━━━━━━━━━━━━━━━━
@@ -820,40 +585,30 @@ def make_signal_message(signal):
 No signal guarantees profit.</i>
 """
 
-    return message
-
 
 # =========================================================
-# AUTOMATIC SIGNAL ENGINE
+# SIGNAL ENGINE
 # =========================================================
 
 def signal_engine():
 
-    print("================================")
-    print(
-        f"{BOT_NAME} signal engine started"
-    )
-    print("================================")
+    print("=" * 45)
+    print(f"{BOT_NAME} Signal Engine Started")
+    print("=" * 45)
 
     while True:
 
         try:
 
             if not subscribers:
-
                 time.sleep(10)
-
                 continue
 
-            print(
-                "Starting market analysis..."
-            )
+            print("Starting market analysis...")
 
             for pair_name, yahoo_symbol in PAIRS.items():
 
-                print(
-                    f"Analyzing {pair_name}..."
-                )
+                print(f"Analyzing {pair_name}...")
 
                 result = analyze_pair(
                     pair_name,
@@ -861,66 +616,45 @@ def signal_engine():
                 )
 
                 if result is None:
-
                     continue
 
                 signal_key = (
                     result["signal"],
-                    round(
-                        result["price"],
-                        5
-                    )
+                    round(result["price"], 5)
                 )
 
-                if (
-                    last_signal.get(
-                        pair_name
-                    )
-                    == signal_key
-                ):
-
+                if last_signal.get(pair_name) == signal_key:
                     continue
 
-                last_signal[
-                    pair_name
-                ] = signal_key
+                last_signal[pair_name] = signal_key
 
-                message = (
-                    make_signal_message(
-                        result
-                    )
-                )
+                message = make_signal_message(result)
 
-                for chat_id in list(
-                    subscribers
-                ):
+                for chat_id in list(subscribers):
 
-                    send_message(
-                        chat_id,
-                        message
-                    )
+                    try:
+                        send_message(chat_id, message)
+
+                    except Exception as e:
+                        print(
+                            f"Message error for {chat_id}: {e}"
+                        )
 
                 print(
-                    f"SIGNAL: "
-                    f"{pair_name} "
+                    f"SIGNAL: {pair_name} "
                     f"{result['signal']} "
                     f"{result['score']}/5"
                 )
 
-                time.sleep(2)
+                time.sleep(1)
 
-            print(
-                "Analysis cycle completed."
-            )
+            print("Analysis cycle completed.")
 
             time.sleep(45)
 
         except Exception as e:
 
-            print(
-                "Signal engine error:",
-                e
-            )
+            print("Signal engine error:", e)
 
             time.sleep(15)
 
@@ -931,9 +665,9 @@ def signal_engine():
 
 def telegram_listener():
 
-    print("================================")
-    print("Telegram listener started")
-    print("================================")
+    print("=" * 45)
+    print("Telegram Listener Started")
+    print("=" * 45)
 
     offset = None
 
@@ -946,97 +680,57 @@ def telegram_listener():
             }
 
             if offset is not None:
-
                 params["offset"] = offset
 
-            response = requests.get(
-                f"https://api.telegram.org/"
-                f"bot{TELEGRAM_TOKEN}/getUpdates",
-                params=params,
-                timeout=35
+            result = telegram_request(
+                "getUpdates",
+                params,
+                request_type="get"
             )
 
-            data = response.json()
-
-            # =================================================
-            # CHECK TELEGRAM RESPONSE
-            # =================================================
-
-            if not data.get("ok"):
-
-                print(
-                    "Telegram getUpdates error:",
-                    data
-                )
-
+            if not result.get("ok"):
                 time.sleep(5)
-
                 continue
 
-            # =================================================
-            # PROCESS UPDATES
-            # =================================================
-
-            updates = data.get(
-                "result",
-                []
-            )
+            updates = result.get("result", [])
 
             for update in updates:
 
-                offset = (
-                    update["update_id"]
-                    + 1
-                )
+                offset = update["update_id"] + 1
 
-                message = update.get(
-                    "message"
-                )
+                message = update.get("message")
 
                 if not message:
-
                     continue
 
-                chat_id = message[
-                    "chat"
-                ]["id"]
+                chat_id = message["chat"]["id"]
 
-                text = message.get(
-                    "text",
-                    ""
-                ).strip()
-
-                print(
-                    f"Telegram message "
-                    f"from {chat_id}: {text}"
+                text = (
+                    message.get("text", "")
+                    .strip()
+                    .lower()
                 )
 
-                # =================================================
-                # START
-                # =================================================
+                print(
+                    f"Message from {chat_id}: {text}"
+                )
 
+                # START
                 if text == "/start":
 
-                    subscribers.add(
-                        chat_id
-                    )
-
-                    print(
-                        "Subscriber added:",
-                        chat_id
-                    )
+                    subscribers.add(chat_id)
 
                     send_message(
                         chat_id,
                         f"""
 <b>👑 {BOT_NAME}</b>
 
-✅ Bot successfully activated.
+✅ Bot successfully activated!
 
 📊 Automatic signal analysis is ON.
 
-⏱ Timeframe: 1 Minute
-⌛ Expiry: 1 Minute
+⏱ Timeframe: <b>{TIMEFRAME}</b>
+⌛ Expiry: <b>{EXPIRY}</b>
 
 <b>Commands:</b>
 
@@ -1053,14 +747,186 @@ No signal guarantees profit.</i>
 """
                     )
 
-                # =================================================
                 # STOP
-                # =================================================
-
                 elif text == "/stop":
 
-                    subscribers.discard(
-                        chat_id
+                    subscribers.discard(chat_id)
+
+                    send_message(
+                        chat_id,
+                        "🛑 Automatic signals stopped."
                     )
 
-              
+                # PAIRS
+                elif text == "/pairs":
+
+                    pair_list = "\n".join(
+                        f"• {pair}"
+                        for pair in PAIRS
+                    )
+
+                    send_message(
+                        chat_id,
+                        f"""
+<b>📊 Available Forex Pairs</b>
+
+{pair_list}
+"""
+                    )
+
+                # STATUS
+                elif text == "/status":
+
+                    active = (
+                        "ON 🟢"
+                        if chat_id in subscribers
+                        else "OFF 🔴"
+                    )
+
+                    send_message(
+                        chat_id,
+                        f"""
+<b>👑 {BOT_NAME}</b>
+
+🤖 Bot: <b>ONLINE</b>
+📡 Signals: <b>{active}</b>
+⏱ Timeframe: <b>{TIMEFRAME}</b>
+⌛ Expiry: <b>{EXPIRY}</b>
+📊 Pairs: <b>{len(PAIRS)}</b>
+
+🟢 Telegram connection: ACTIVE
+"""
+                    )
+
+                # MANUAL SIGNAL
+                elif text == "/signal":
+
+                    send_message(
+                        chat_id,
+                        "🔎 Market analysis started..."
+                    )
+
+                    found = False
+
+                    for pair_name, yahoo_symbol in PAIRS.items():
+
+                        result = analyze_pair(
+                            pair_name,
+                            yahoo_symbol
+                        )
+
+                        if result:
+
+                            send_message(
+                                chat_id,
+                                make_signal_message(result)
+                            )
+
+                            found = True
+                            break
+
+                    if not found:
+
+                        send_message(
+                            chat_id,
+                            """
+⚠️ No strong signal found right now.
+
+Please wait for stronger indicator agreement.
+"""
+                        )
+
+                # UNKNOWN COMMAND
+                elif text.startswith("/"):
+
+                    send_message(
+                        chat_id,
+                        """
+❓ Unknown command.
+
+Use:
+
+/start
+/stop
+/signal
+/pairs
+/status
+"""
+                    )
+
+        except Exception as e:
+
+            print("Telegram listener error:", e)
+
+            time.sleep(10)
+
+
+# =========================================================
+# START BACKGROUND SERVICES
+# =========================================================
+
+def start_background_services():
+
+    global telegram_started
+
+    if telegram_started:
+        return
+
+    telegram_started = True
+
+    if not TELEGRAM_TOKEN:
+
+        print("=" * 45)
+        print("ERROR: TELEGRAM_TOKEN is NOT set!")
+        print("=" * 45)
+
+        return
+
+    print("Telegram token detected.")
+
+    if not test_telegram():
+
+        print("Telegram services were NOT started.")
+        return
+
+    remove_webhook()
+
+    listener_thread = threading.Thread(
+        target=telegram_listener,
+        daemon=True
+    )
+
+    engine_thread = threading.Thread(
+        target=signal_engine,
+        daemon=True
+    )
+
+    listener_thread.start()
+    engine_thread.start()
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+if __name__ == "__main__":
+
+    print("")
+    print("=" * 45)
+    print(f"Starting {BOT_NAME}")
+    print("=" * 45)
+
+    start_background_services()
+
+    port = int(
+        os.environ.get("PORT", 10000)
+    )
+
+    print(f"Starting Flask server on port {port}")
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+        use_reloader=False
+            ) 
