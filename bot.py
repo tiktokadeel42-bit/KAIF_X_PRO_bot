@@ -2,17 +2,15 @@ import os
 import time
 import math
 import threading
-from datetime import datetime
 
 import requests
+from flask import Flask, jsonify
 
 import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
-
-from flask import Flask, jsonify
 
 
 # =========================================================
@@ -23,19 +21,14 @@ BOT_NAME = "KAIF X PRO BOT"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 
+PORT = int(os.getenv("PORT", "10000"))
+
 TIMEFRAME = "1 MINUTE"
 EXPIRY = "1 MINUTE"
 
 ANALYSIS_INTERVAL = 60
 MIN_SCORE = 4
 
-CHART_DIR = "generated_charts"
-os.makedirs(CHART_DIR, exist_ok=True)
-
-
-# =========================================================
-# LIVE MARKET PAIRS
-# =========================================================
 
 LIVE_PAIRS = {
     "EUR/USD": "EURUSD=X",
@@ -51,34 +44,19 @@ LIVE_PAIRS = {
 }
 
 
-# =========================================================
-# OTC PAIRS
-#
-# IMPORTANT:
-# These are only pair names for the OTC module.
-# Real candles must come from an authorized/valid data source.
-# =========================================================
-
-OTC_PAIRS = [
-    "EUR/USD OTC",
-    "GBP/USD OTC",
-    "USD/JPY OTC",
-    "AUD/USD OTC",
-    "USD/CAD OTC",
-    "USD/CHF OTC",
-    "EUR/JPY OTC",
-    "GBP/JPY OTC",
-]
-
-
 subscribers = set()
 
-state_lock = threading.Lock()
+lock = threading.Lock()
 
 services_started = False
 
 last_sent_key = None
 last_sent_time = 0
+
+
+CHART_DIR = "generated_charts"
+
+os.makedirs(CHART_DIR, exist_ok=True)
 
 
 # =========================================================
@@ -90,7 +68,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return f"{BOT_NAME} is running"
+    return "Bot is running", 200
 
 
 @app.route("/health")
@@ -102,11 +80,10 @@ def health():
 def status():
     return jsonify({
         "bot": BOT_NAME,
-        "telegram": bool(TELEGRAM_TOKEN),
+        "telegram_configured": bool(TELEGRAM_TOKEN),
         "subscribers": len(subscribers),
         "live_pairs": len(LIVE_PAIRS),
-        "otc_pairs": len(OTC_PAIRS),
-        "mode": "BEST SINGLE SIGNAL"
+        "otc": "Requires authorized candle data feed"
     })
 
 
@@ -114,14 +91,15 @@ def status():
 # TELEGRAM
 # =========================================================
 
-TELEGRAM_BASE = "https://api.telegram.org"
+def tg_url(method):
+
+    return (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_TOKEN}/{method}"
+    )
 
 
-def telegram_url(method):
-    return f"{TELEGRAM_BASE}/bot{TELEGRAM_TOKEN}/{method}"
-
-
-def telegram_request(method, data=None):
+def tg_post(method, data=None, files=None, timeout=60):
 
     if not TELEGRAM_TOKEN:
         return {}
@@ -129,21 +107,22 @@ def telegram_request(method, data=None):
     try:
 
         response = requests.post(
-            telegram_url(method),
+            tg_url(method),
             data=data or {},
-            timeout=30
+            files=files,
+            timeout=timeout
         )
 
         return response.json()
 
-    except Exception as e:
+    except Exception as exc:
 
-        print("Telegram error:", e)
+        print("Telegram error:", exc)
 
         return {}
 
 
-def telegram_get_updates(params):
+def tg_get_updates(params):
 
     if not TELEGRAM_TOKEN:
         return {}
@@ -151,23 +130,23 @@ def telegram_get_updates(params):
     try:
 
         response = requests.get(
-            telegram_url("getUpdates"),
+            tg_url("getUpdates"),
             params=params,
             timeout=40
         )
 
         return response.json()
 
-    except Exception as e:
+    except Exception as exc:
 
-        print("Telegram updates error:", e)
+        print("Telegram updates error:", exc)
 
         return {}
 
 
 def send_message(chat_id, text):
 
-    return telegram_request(
+    return tg_post(
         "sendMessage",
         {
             "chat_id": str(chat_id),
@@ -179,31 +158,25 @@ def send_message(chat_id, text):
 
 def send_photo(chat_id, path, caption):
 
-    if not TELEGRAM_TOKEN:
-        return {}
-
     try:
 
-        with open(path, "rb") as photo:
+        with open(path, "rb") as image_file:
 
-            response = requests.post(
-                telegram_url("sendPhoto"),
-                data={
+            return tg_post(
+                "sendPhoto",
+                {
                     "chat_id": str(chat_id),
                     "caption": caption,
                     "parse_mode": "HTML"
                 },
                 files={
-                    "photo": photo
-                },
-                timeout=60
+                    "photo": image_file
+                }
             )
 
-        return response.json()
+    except Exception as exc:
 
-    except Exception as e:
-
-        print("Photo error:", e)
+        print("send_photo error:", exc)
 
         return {}
 
@@ -235,132 +208,117 @@ def get_live_candles(symbol):
             timeout=20
         )
 
-        if response.status_code != 200:
+        response.raise_for_status()
+
+        payload = response.json()
+
+        results = (
+            payload
+            .get("chart", {})
+            .get("result")
+            or []
+        )
+
+        if not results:
             return []
 
-        data = response.json()
+        result = results[0]
 
-        result = (
-            data.get("chart", {})
-            .get("result", [])
+        timestamps = (
+            result.get("timestamp")
+            or []
         )
 
-        if not result:
-            return []
-
-        result = result[0]
-
-        timestamps = result.get(
-            "timestamp",
-            []
+        quote_list = (
+            result
+            .get("indicators", {})
+            .get("quote")
+            or [{}]
         )
 
-        quote = (
-            result.get("indicators", {})
-            .get("quote", [{}])[0]
-        )
+        quote = quote_list[0]
 
-        opens = quote.get("open", [])
-        highs = quote.get("high", [])
-        lows = quote.get("low", [])
-        closes = quote.get("close", [])
+        opens = quote.get("open") or []
+        highs = quote.get("high") or []
+        lows = quote.get("low") or []
+        closes = quote.get("close") or []
 
         candles = []
 
-        for i in range(
-            min(
-                len(timestamps),
-                len(opens),
-                len(highs),
-                len(lows),
-                len(closes)
+        count = min(
+            len(timestamps),
+            len(opens),
+            len(highs),
+            len(lows),
+            len(closes)
+        )
+
+        for index in range(count):
+
+            values = (
+                opens[index],
+                highs[index],
+                lows[index],
+                closes[index]
             )
-        ):
 
-            values = [
-                opens[i],
-                highs[i],
-                lows[i],
-                closes[i]
-            ]
-
-            if any(v is None for v in values):
+            if any(
+                value is None
+                for value in values
+            ):
                 continue
 
             candles.append({
-                "timestamp": timestamps[i],
-                "open": float(opens[i]),
-                "high": float(highs[i]),
-                "low": float(lows[i]),
-                "close": float(closes[i])
+                "timestamp": timestamps[index],
+                "open": float(opens[index]),
+                "high": float(highs[index]),
+                "low": float(lows[index]),
+                "close": float(closes[index])
             })
 
         return candles
 
-    except Exception as e:
+    except Exception as exc:
 
         print(
-            "Live market error:",
-            symbol,
-            e
+            f"Market data error for {symbol}:",
+            exc
         )
 
         return []
 
 
 # =========================================================
-# OTC MARKET DATA
-#
-# CONNECT YOUR AUTHORIZED DATA SOURCE HERE
-# =========================================================
-
-def get_otc_candles(pair):
-
-    """
-    This function intentionally returns an empty list
-    until a valid authorized OTC candle feed is connected.
-
-    Expected output format:
-
-    [
-        {
-            "timestamp": 1234567890,
-            "open": 1.10000,
-            "high": 1.10100,
-            "low": 1.09900,
-            "close": 1.10050
-        }
-    ]
-    """
-
-    return []
-
-
-# =========================================================
 # INDICATORS
 # =========================================================
 
-def calculate_ema(values, period):
+def ema(values, period):
 
     if len(values) < period:
         return None
 
-    multiplier = 2 / (period + 1)
+    value = (
+        sum(values[:period])
+        / period
+    )
 
-    ema = sum(values[:period]) / period
+    multiplier = (
+        2.0
+        / (period + 1)
+    )
 
-    for value in values[period:]:
+    for price in values[period:]:
 
-        ema = (
-            (value - ema)
+        value = (
+            (price - value)
             * multiplier
-            + ema
+            + value
         )
 
-    return ema
+    return value
 
 
-def calculate_rsi(values, period=14):
+def rsi(values, period=14):
 
     if len(values) < period + 1:
         return None
@@ -368,238 +326,281 @@ def calculate_rsi(values, period=14):
     gains = []
     losses = []
 
-    for i in range(1, len(values)):
+    for index in range(1, len(values)):
 
-        change = values[i] - values[i - 1]
+        change = (
+            values[index]
+            - values[index - 1]
+        )
 
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
+        gains.append(
+            max(change, 0)
+        )
 
-    recent_gains = gains[-period:]
-    recent_losses = losses[-period:]
+        losses.append(
+            max(-change, 0)
+        )
 
     avg_gain = (
-        sum(recent_gains)
+        sum(gains[-period:])
         / period
     )
 
     avg_loss = (
-        sum(recent_losses)
+        sum(losses[-period:])
         / period
     )
 
     if avg_loss == 0:
-        return 100
+        return 100.0
 
-    rs = avg_gain / avg_loss
+    rs = (
+        avg_gain
+        / avg_loss
+    )
 
-    return 100 - (100 / (1 + rs))
+    return (
+        100.0
+        - (
+            100.0
+            / (1.0 + rs)
+        )
+    )
 
 
-def calculate_bollinger(values, period=20):
+def bollinger(values, period=20):
 
     if len(values) < period:
         return None, None, None
 
     recent = values[-period:]
 
-    middle = sum(recent) / period
+    middle = (
+        sum(recent)
+        / period
+    )
 
-    variance = sum(
-        (x - middle) ** 2
-        for x in recent
-    ) / period
+    variance = (
+        sum(
+            (value - middle) ** 2
+            for value in recent
+        )
+        / period
+    )
 
-    std = math.sqrt(variance)
+    deviation = math.sqrt(variance)
 
-    upper = middle + 2 * std
-    lower = middle - 2 * std
+    upper = (
+        middle
+        + 2 * deviation
+    )
+
+    lower = (
+        middle
+        - 2 * deviation
+    )
 
     return upper, middle, lower
 
 
-def calculate_atr(candles, period=14):
+def atr(candles, period=14):
 
     if len(candles) < period + 1:
         return None
 
     ranges = []
 
-    for i in range(
+    for index in range(
         len(candles) - period,
         len(candles)
     ):
 
-        current = candles[i]
-        previous = candles[i - 1]
+        current = candles[index]
 
-        tr = max(
-            current["high"] - current["low"],
+        previous_close = (
+            candles[index - 1]["close"]
+        )
+
+        true_range = max(
+            current["high"]
+            - current["low"],
+
             abs(
                 current["high"]
-                - previous["close"]
+                - previous_close
             ),
+
             abs(
                 current["low"]
-                - previous["close"]
+                - previous_close
             )
         )
 
-        ranges.append(tr)
+        ranges.append(true_range)
 
-    return sum(ranges) / len(ranges)
+    return (
+        sum(ranges)
+        / len(ranges)
+    )
 
 
 # =========================================================
-# ANALYZE CANDLES
+# ANALYZE PAIR
 # =========================================================
 
-def analyze_candles(
-    pair,
-    market_type,
-    candles
-):
+def analyze_pair(pair, symbol):
+
+    candles = get_live_candles(symbol)
 
     if len(candles) < 50:
         return None
 
     closes = [
-        c["close"]
-        for c in candles
+        candle["close"]
+        for candle in candles
     ]
 
-    price = closes[-1]
+    ema9 = ema(closes, 9)
 
-    ema9 = calculate_ema(closes, 9)
-    ema21 = calculate_ema(closes, 21)
+    ema21 = ema(closes, 21)
 
-    rsi = calculate_rsi(closes, 14)
+    rsi_value = rsi(closes, 14)
 
     upper, middle, lower = (
-        calculate_bollinger(
-            closes,
-            20
-        )
+        bollinger(closes, 20)
     )
 
-    atr = calculate_atr(
-        candles,
-        14
+    atr_value = atr(candles, 14)
+
+    required_values = (
+        ema9,
+        ema21,
+        rsi_value,
+        middle,
+        atr_value
     )
 
     if any(
-        x is None
-        for x in [
-            ema9,
-            ema21,
-            rsi,
-            middle,
-            atr
-        ]
+        value is None
+        for value in required_values
     ):
         return None
+
+    last = candles[-1]
+
+    previous = candles[-2]
+
+    price = last["close"]
 
     call_score = 0
     put_score = 0
 
-    reasons_call = []
-    reasons_put = []
+    call_reasons = []
+    put_reasons = []
 
-    # EMA
+
+    # EMA TREND
 
     if ema9 > ema21:
 
         call_score += 1
-        reasons_call.append(
-            "EMA trend bullish"
+
+        call_reasons.append(
+            "EMA trend is bullish"
         )
 
     else:
 
         put_score += 1
-        reasons_put.append(
-            "EMA trend bearish"
+
+        put_reasons.append(
+            "EMA trend is bearish"
         )
+
 
     # RSI
 
-    if 50 < rsi < 70:
+    if 50 < rsi_value < 70:
 
         call_score += 1
-        reasons_call.append(
-            "RSI bullish zone"
+
+        call_reasons.append(
+            "RSI is in bullish zone"
         )
 
-    elif 30 < rsi < 50:
+    elif 30 < rsi_value < 50:
 
         put_score += 1
-        reasons_put.append(
-            "RSI bearish zone"
+
+        put_reasons.append(
+            "RSI is in bearish zone"
         )
 
-    # Bollinger
+
+    # BOLLINGER
 
     if price > middle:
 
         call_score += 1
-        reasons_call.append(
-            "Price above middle trend"
+
+        call_reasons.append(
+            "Price is above middle trend"
         )
 
-    else:
+    elif price < middle:
 
         put_score += 1
-        reasons_put.append(
-            "Price below middle trend"
+
+        put_reasons.append(
+            "Price is below middle trend"
         )
 
-    # Last candle
 
-    last = candles[-1]
+    # LAST CANDLE
 
     if last["close"] > last["open"]:
 
         call_score += 1
-        reasons_call.append(
-            "Last candle bullish"
+
+        call_reasons.append(
+            "Last candle is bullish"
         )
 
     elif last["close"] < last["open"]:
 
         put_score += 1
-        reasons_put.append(
-            "Last candle bearish"
+
+        put_reasons.append(
+            "Last candle is bearish"
         )
 
-    # Previous candle
 
-    previous = candles[-2]
+    # LAST TWO CANDLES
 
     if (
-        previous["close"]
-        > previous["open"]
-        and last["close"]
-        > last["open"]
+        previous["close"] > previous["open"]
+        and last["close"] > last["open"]
     ):
 
         call_score += 1
-        reasons_call.append(
-            "Two candles bullish"
+
+        call_reasons.append(
+            "Last two candles are bullish"
         )
 
     elif (
-        previous["close"]
-        < previous["open"]
-        and last["close"]
-        < last["open"]
+        previous["close"] < previous["open"]
+        and last["close"] < last["open"]
     ):
 
         put_score += 1
-        reasons_put.append(
-            "Two candles bearish"
+
+        put_reasons.append(
+            "Last two candles are bearish"
         )
 
-    # Final
+
+    # FINAL SIGNAL
 
     if (
         call_score >= MIN_SCORE
@@ -607,8 +608,10 @@ def analyze_candles(
     ):
 
         direction = "CALL"
+
         score = call_score
-        reasons = reasons_call
+
+        reasons = call_reasons
 
     elif (
         put_score >= MIN_SCORE
@@ -616,185 +619,154 @@ def analyze_candles(
     ):
 
         direction = "PUT"
+
         score = put_score
-        reasons = reasons_put
+
+        reasons = put_reasons
 
     else:
 
         return None
 
+
     confidence = int(
-        (score / 5) * 100
+        score * 20
     )
 
-    strength = (
-        score * 100
-        + confidence
-    )
 
     return {
         "pair": pair,
-        "market": market_type,
+        "market": "LIVE MARKET",
         "signal": direction,
         "score": score,
         "confidence": confidence,
-        "strength": strength,
+        "strength": (
+            score * 100
+            + confidence
+        ),
         "price": price,
-        "rsi": rsi,
-        "atr": atr,
+        "atr": atr_value,
         "reasons": reasons,
         "candles": candles
     }
 
 
 # =========================================================
-# SCAN LIVE MARKET
+# GET BEST SIGNAL
 # =========================================================
 
-def scan_live_market():
+def get_best_signal():
 
-    results = []
+    candidates = []
+
+    print("Scanning all live pairs...")
 
     for pair, symbol in LIVE_PAIRS.items():
 
         try:
 
-            candles = get_live_candles(symbol)
-
-            result = analyze_candles(
+            result = analyze_pair(
                 pair,
-                "LIVE MARKET",
-                candles
+                symbol
             )
 
             if result:
-                results.append(result)
 
-        except Exception as e:
+                candidates.append(result)
 
-            print(
-                "Live scan error:",
-                pair,
-                e
-            )
+                print(
+                    f"{pair}: "
+                    f"{result['signal']} "
+                    f"score={result['score']} "
+                    f"confidence={result['confidence']}%"
+                )
 
-        time.sleep(0.3)
-
-    return results
-
-
-# =========================================================
-# SCAN OTC MARKET
-# =========================================================
-
-def scan_otc_market():
-
-    results = []
-
-    for pair in OTC_PAIRS:
-
-        try:
-
-            candles = get_otc_candles(pair)
-
-            if not candles:
-                continue
-
-            result = analyze_candles(
-                pair,
-                "OTC MARKET",
-                candles
-            )
-
-            if result:
-                results.append(result)
-
-        except Exception as e:
+        except Exception as exc:
 
             print(
-                "OTC scan error:",
-                pair,
-                e
+                f"Analysis error for {pair}:",
+                exc
             )
 
-    return results
+        time.sleep(0.2)
 
 
-# =========================================================
-# GET BEST SIGNAL FROM BOTH MARKETS
-# =========================================================
-
-def get_best_signal():
-
-    print("\nScanning LIVE MARKET...")
-
-    live_results = scan_live_market()
-
-    print("Scanning OTC MARKET...")
-
-    otc_results = scan_otc_market()
-
-    all_results = (
-        live_results
-        + otc_results
-    )
-
-    if not all_results:
+    if not candidates:
 
         return None
 
-    all_results.sort(
-        key=lambda x: (
-            x["strength"],
-            x["score"],
-            x["confidence"]
+
+    candidates.sort(
+        key=lambda item: (
+            item["strength"],
+            item["score"]
         ),
         reverse=True
     )
 
-    return all_results[0]
+
+    return candidates[0]
 
 
 # =========================================================
 # PROJECT NEXT CANDLE
 # =========================================================
 
-def build_projected_candle(signal):
+def projected_candle(signal):
 
     price = signal["price"]
-    atr = signal["atr"]
+
+    atr_value = signal["atr"]
 
     body = max(
-        atr * 0.55,
+        atr_value * 0.55,
         price * 0.00003
     )
 
     wick = max(
-        atr * 0.25,
+        atr_value * 0.25,
         price * 0.00001
     )
+
 
     if signal["signal"] == "CALL":
 
         opening = price
-        closing = price + body
 
-        low = opening - wick
-        high = closing + wick
+        closing = (
+            price + body
+        )
+
+        low = (
+            opening - wick
+        )
+
+        high = (
+            closing + wick
+        )
 
     else:
 
         opening = price
-        closing = price - body
 
-        high = opening + wick
-        low = closing - wick
+        closing = (
+            price - body
+        )
+
+        high = (
+            opening + wick
+        )
+
+        low = (
+            closing - wick
+        )
+
 
     return {
         "open": opening,
-        "close": closing,
         "high": high,
-        "low": low
+        "low": low,
+        "close": closing
     }
 
 
@@ -803,7 +775,7 @@ def build_projected_candle(signal):
 # =========================================================
 
 def draw_candle(
-    ax,
+    axis,
     x,
     candle,
     alpha=1.0,
@@ -816,12 +788,13 @@ def draw_candle(
     )
 
     color = (
-        "#00c853"
+        "green"
         if bullish
-        else "#ff1744"
+        else "red"
     )
 
-    ax.vlines(
+
+    axis.vlines(
         x,
         candle["low"],
         candle["high"],
@@ -831,77 +804,120 @@ def draw_candle(
         linestyles=linestyle
     )
 
-    low_body = min(
+
+    body_low = min(
         candle["open"],
         candle["close"]
     )
 
-    height = abs(
+
+    body_height = abs(
         candle["close"]
         - candle["open"]
     )
 
-    minimum = (
-        candle["high"]
-        - candle["low"]
-    ) * 0.04
 
-    if height < minimum:
-        height = minimum
+    minimum = max(
+        (
+            candle["high"]
+            - candle["low"]
+        ) * 0.03,
+        1e-10
+    )
+
+
+    if body_height < minimum:
+
+        body_height = minimum
+
 
     rectangle = Rectangle(
         (
             x - 0.3,
-            low_body
+            body_low
         ),
         0.6,
-        height,
+        body_height,
         facecolor=color,
         edgecolor=color,
         alpha=alpha,
         linestyle=linestyle
     )
 
-    ax.add_patch(rectangle)
+
+    axis.add_patch(rectangle)
 
 
 # =========================================================
-# CREATE SIGNAL IMAGE
+# CREATE CHART
 # =========================================================
 
-def create_signal_chart(signal):
+def create_chart(signal):
 
-    candles = signal["candles"]
-
-    previous = candles[-2]
-    last = candles[-1]
-
-    projected = build_projected_candle(
-        signal
+    previous = (
+        signal["candles"][-2]
     )
 
-    fig, ax = plt.subplots(
+    last = (
+        signal["candles"][-1]
+    )
+
+    next_candle = (
+        projected_candle(signal)
+    )
+
+
+    figure, axis = plt.subplots(
         figsize=(9, 6)
     )
 
-    fig.patch.set_facecolor("#111111")
-    ax.set_facecolor("#111111")
 
-    draw_candle(ax, 0, previous)
+    figure.patch.set_facecolor(
+        "#111111"
+    )
 
-    draw_candle(ax, 1, last)
+    axis.set_facecolor(
+        "#111111"
+    )
+
 
     draw_candle(
-        ax,
+        axis,
+        0,
+        previous
+    )
+
+    draw_candle(
+        axis,
+        1,
+        last
+    )
+
+    draw_candle(
+        axis,
         2,
-        projected,
+        next_candle,
         alpha=0.5,
         linestyle="--"
     )
 
-    ax.set_xticks([0, 1, 2])
 
-    ax.set_xticklabels(
+    axis.set_title(
+        "LAST 2 MARKET CANDLES + NEXT TRADE SETUP",
+        color="white",
+        fontsize=14,
+        fontweight="bold"
+    )
+
+
+    axis.set_xticks([
+        0,
+        1,
+        2
+    ])
+
+
+    axis.set_xticklabels(
         [
             "PREVIOUS",
             "LAST CANDLE",
@@ -910,132 +926,218 @@ def create_signal_chart(signal):
         color="white"
     )
 
-    ax.tick_params(
+
+    axis.tick_params(
         axis="y",
         colors="white"
     )
 
-    for spine in ax.spines.values():
+
+    for spine in axis.spines.values():
+
         spine.set_color("#666666")
 
-    ax.grid(
-        True,
-        linestyle=":",
-        alpha=0.25
-    )
-
-    ax.set_title(
-        "LAST 2 MARKET CANDLES + NEXT TRADE SETUP",
-        color="white",
-        fontsize=14,
-        fontweight="bold"
-    )
 
     prices = [
         previous["low"],
         previous["high"],
         last["low"],
         last["high"],
-        projected["low"],
-        projected["high"]
+        next_candle["low"],
+        next_candle["high"]
     ]
 
-    padding = (
+
+    price_range = (
         max(prices)
         - min(prices)
-    ) * 0.2
+    )
 
-    ax.set_ylim(
+
+    padding = max(
+        price_range * 0.2,
+        signal["price"] * 0.00005
+    )
+
+
+    axis.set_ylim(
         min(prices) - padding,
         max(prices) + padding
     )
 
-    filename = (
-        f"{CHART_DIR}/signal_"
-        f"{int(time.time())}.png"
+
+    axis.set_xlim(
+        -0.8,
+        2.8
     )
+
+
+    axis.grid(
+        True,
+        linestyle=":",
+        alpha=0.25
+    )
+
+
+    filename = os.path.join(
+        CHART_DIR,
+        f"signal_{int(time.time())}.png"
+    )
+
 
     plt.tight_layout()
 
+
     plt.savefig(
         filename,
-        dpi=150
+        dpi=150,
+        bbox_inches="tight"
     )
 
-    plt.close()
 
-    return filename, projected
+    plt.close(figure)
+
+
+    return filename, next_candle
 
 
 # =========================================================
-# CAPTION
+# SIGNAL CAPTION
 # =========================================================
 
 def make_caption(
     signal,
-    projected
+    next_candle
 ):
 
-    emoji = (
-        "🟢"
-        if signal["signal"] == "CALL"
-        else "🔴"
-    )
+    if signal["signal"] == "CALL":
+
+        direction = "🟢 CALL / UP"
+
+    else:
+
+        direction = "🔴 PUT / DOWN"
+
 
     reasons = "\n".join(
-        f"• {x}"
-        for x in signal["reasons"]
+        f"• {reason}"
+        for reason in signal["reasons"]
     )
 
-    return f"""
-👑 <b>{BOT_NAME}</b>
 
-🏆 <b>BEST SINGLE SIGNAL</b>
+    return (
+        f"👑 <b>{BOT_NAME}</b>\n\n"
 
-🌐 <b>MARKET:</b> {signal["market"]}
+        f"🏆 <b>BEST SINGLE SIGNAL</b>\n\n"
 
-💱 <b>PAIR:</b> {signal["pair"]}
+        f"🌐 <b>MARKET:</b> {signal['market']}\n"
 
-{emoji} <b>DIRECTION:</b> {signal["signal"]}
+        f"💱 <b>PAIR:</b> {signal['pair']}\n"
 
-📊 <b>CONFIDENCE:</b> {signal["confidence"]}%
+        f"{direction}\n"
 
-⭐ <b>SCORE:</b> {signal["score"]}/5
+        f"📊 <b>CONFIDENCE:</b> "
+        f"{signal['confidence']}%\n"
 
-⏱ <b>TIMEFRAME:</b> {TIMEFRAME}
+        f"⭐ <b>SCORE:</b> "
+        f"{signal['score']}/5\n"
 
-⌛ <b>EXPIRY:</b> {EXPIRY}
+        f"⏱ <b>TIMEFRAME:</b> "
+        f"{TIMEFRAME}\n"
 
-━━━━━━━━━━━━━━━━
+        f"⌛ <b>EXPIRY:</b> "
+        f"{EXPIRY}\n\n"
 
-🎯 <b>TRADE:</b> NEXT CANDLE
+        f"━━━━━━━━━━━━━━━━\n\n"
 
-💰 <b>ENTRY:</b> {projected["open"]:.5f}
+        f"🎯 <b>TRADE:</b> NEXT CANDLE\n"
 
-📈 <b>PROJECTED HIGH:</b> {projected["high"]:.5f}
+        f"💰 <b>ENTRY:</b> "
+        f"{next_candle['open']:.5f}\n"
 
-📉 <b>PROJECTED LOW:</b> {projected["low"]:.5f}
+        f"📈 <b>PROJECTED HIGH:</b> "
+        f"{next_candle['high']:.5f}\n"
 
-━━━━━━━━━━━━━━━━
+        f"📉 <b>PROJECTED LOW:</b> "
+        f"{next_candle['low']:.5f}\n\n"
 
-🔎 <b>ANALYSIS:</b>
+        f"━━━━━━━━━━━━━━━━\n\n"
 
-{reasons}
+        f"🔎 <b>ANALYSIS:</b>\n\n"
 
-━━━━━━━━━━━━━━━━
+        f"{reasons}\n\n"
 
-⚠️ <i>Technical analysis only. No trade or profit is guaranteed.</i>
-"""
+        f"⚠️ <i>Technical analysis only. "
+        f"No profit is guaranteed.</i>"
+    )
 
 
 # =========================================================
-# SIGNAL ENGINE
+# SEND ONE SIGNAL
+# =========================================================
+
+def send_best_signal(chat_id):
+
+    best = get_best_signal()
+
+
+    if not best:
+
+        send_message(
+            chat_id,
+            "⚠️ No strong signal found right now."
+        )
+
+        return
+
+
+    path = None
+
+
+    try:
+
+        path, next_candle = create_chart(best)
+
+        caption = make_caption(
+            best,
+            next_candle
+        )
+
+
+        result = send_photo(
+            chat_id,
+            path,
+            caption
+        )
+
+
+        if not result.get("ok"):
+
+            send_message(
+                chat_id,
+                caption
+            )
+
+
+    finally:
+
+        if (
+            path
+            and os.path.exists(path)
+        ):
+
+            os.remove(path)
+
+
+# =========================================================
+# AUTOMATIC SIGNAL ENGINE
 # =========================================================
 
 def signal_engine():
 
     global last_sent_key
     global last_sent_time
+
 
     while True:
 
@@ -1044,13 +1146,18 @@ def signal_engine():
             if not subscribers:
 
                 time.sleep(10)
+
                 continue
+
 
             best = get_best_signal()
 
+
             if not best:
 
-                print("No strong signal.")
+                print(
+                    "No strong signal found."
+                )
 
                 time.sleep(
                     ANALYSIS_INTERVAL
@@ -1058,19 +1165,27 @@ def signal_engine():
 
                 continue
 
+
             key = (
-                best["market"],
                 best["pair"],
                 best["signal"],
-                round(best["price"], 5)
+                best["score"],
+                round(
+                    best["price"],
+                    5
+                )
             )
+
 
             now = time.time()
 
+
             if (
                 key == last_sent_key
-                and now - last_sent_time
-                < ANALYSIS_INTERVAL
+                and (
+                    now - last_sent_time
+                    < ANALYSIS_INTERVAL
+                )
             ):
 
                 time.sleep(
@@ -1079,34 +1194,23 @@ def signal_engine():
 
                 continue
 
-            path, projected = (
-                create_signal_chart(best)
-            )
 
-            caption = make_caption(
-                best,
-                projected
-            )
+            path = None
 
-            for chat_id in list(subscribers):
 
-                send_photo(
-                    chat_id,
-                    path,
-                    caption
+            try:
+
+                path, next_candle = create_chart(best)
+
+                caption = make_caption(
+                    best,
+                    next_candle
                 )
 
-            last_sent_key = key
-            last_sent_time = now
 
-            if os.path.exists(path):
-                os.remove(path)
+                for chat_id in list(subscribers):
 
-            time.sleep(
-                ANALYSIS_INTERVAL
-            )
-
-        except Exception as e:
-
-            print(
-                "Engine error:"
+                    send_photo(
+                        chat_id,
+                        path,
+    
